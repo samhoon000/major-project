@@ -6,7 +6,7 @@ import random
 def visualize():
     print("Loading graph data...")
     try:
-        data = torch.load("data/graph_data.pt")
+        data = torch.load("data/graph_data.pt", weights_only=False)
     except FileNotFoundError:
         print("Graph data not found. Please run train.py first.")
         return
