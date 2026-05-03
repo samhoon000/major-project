@@ -1,0 +1,14 @@
+# Data
+data/
+*.csv
+
+# Model
+model.pth
+
+# Python
+__pycache__/
+*.pyc
+
+# Env
+venv/
+.env

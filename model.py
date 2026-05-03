@@ -1,30 +1,33 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import GCNConv
+from torch_geometric.nn import SAGEConv
 
-class GNNAnomalyDetector(torch.nn.Module):
-    def __init__(self, num_features, hidden_size=64, num_classes=2, dropout_rate=0.4):
-        super(GNNAnomalyDetector, self).__init__()
-        # First GCN layer
-        self.conv1 = GCNConv(num_features, hidden_size)
-        # Second GCN layer
-        self.conv2 = GCNConv(hidden_size, hidden_size)
-        
-        # Final classifier layer
-        self.classifier = torch.nn.Linear(hidden_size, num_classes)
-        self.dropout_rate = dropout_rate
+class GNNAnomalyDetector(nn.Module):
+    def __init__(self, node_dim, edge_dim):
+        super().__init__()
 
-    def forward(self, x, edge_index):
-        # Layer 1
-        x = self.conv1(x, edge_index)
-        x = F.relu(x)
-        x = F.dropout(x, p=self.dropout_rate, training=self.training)
-        
-        # Layer 2
-        x = self.conv2(x, edge_index)
-        x = F.relu(x)
-        x = F.dropout(x, p=self.dropout_rate, training=self.training)
-        
-        # Classification
-        out = self.classifier(x)
-        return out
+        self.conv1 = SAGEConv(node_dim, 64)
+        self.conv2 = SAGEConv(64, 64)
+
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(64 * 2 + edge_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.5),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2)
+        )
+
+    def forward(self, x, edge_index, edge_attr):
+        x = F.relu(self.conv1(x, edge_index))
+        x = F.dropout(x, p=0.5, training=self.training)
+
+        x = F.relu(self.conv2(x, edge_index))
+        x = F.dropout(x, p=0.5, training=self.training)
+
+        src, dst = edge_index
+
+        edge_features = torch.cat([x[src], x[dst], edge_attr], dim=1)
+
+        return self.edge_mlp(edge_features)
