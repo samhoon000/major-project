@@ -89,7 +89,18 @@ def build_graphs(input_file="data/full_dataset.csv"):
 
         y = torch.tensor(df_part["Label"].values, dtype=torch.long)
 
-        return Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
+        data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y)
+        data.source_ip = df_part["Source IP"].astype(str).tolist()
+        data.destination_ip = df_part["Destination IP"].astype(str).tolist()
+        data.protocol = df_part.get("Protocol", pd.Series(["Unknown"] * len(df_part))).astype(str).tolist()
+
+        packet_size_col = "Average Packet Size" if "Average Packet Size" in df_part.columns else "Packet Length Mean"
+        if packet_size_col in df_part.columns:
+            data.packet_size = df_part[packet_size_col].fillna(0).astype(float).tolist()
+        else:
+            data.packet_size = [0.0] * len(df_part)
+
+        return data
 
     train_data = build_edges(train_df)
     test_data = build_edges(test_df)

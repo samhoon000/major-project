@@ -3,8 +3,11 @@ scikit-learn
 joblib
 matplotlib
 seaborn
-torch
-torchvision
-torchaudio
+fastapi
+uvicorn
+python-multipart
+#torch
+#torchvision
+#torchaudio
 torch-geometric
 networkx
