@@ -9,8 +9,11 @@ from fastapi import FastAPI, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
+from backend.chat_service import router as chat_router
+from backend.network.runtime import network_runtime
 
 app = FastAPI(title="Network Anomaly Detection API")
+app.include_router(chat_router)
 
 # Enable CORS for frontend
 app.add_middleware(
@@ -417,8 +420,19 @@ def home():
     """
 
 @app.on_event("startup")
-def startup_event():
+async def startup_event():
     load_dataset()
+    await network_runtime.start()
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await network_runtime.stop()
+
+
+@app.get("/api/network/state")
+def network_state():
+    return network_runtime.status()
 
 @app.get("/api/dataset")
 def get_dataset(page: int = 1, page_size: int = 15):

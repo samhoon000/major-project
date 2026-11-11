@@ -1,0 +1,19 @@
+{
+  "edge_features": [
+    "Flow Duration",
+    "Total Fwd Packets",
+    "Total Backward Packets",
+    "Flow Bytes/s",
+    "Flow Packets/s"
+  ],
+  "node_features": [
+    "in_degree",
+    "out_degree",
+    "total_packets",
+    "total_bytes",
+    "avg_duration"
+  ],
+  "node_dim": 5,
+  "edge_dim": 5,
+  "log_transform": true
+}
