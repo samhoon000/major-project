@@ -9,8 +9,13 @@ from fastapi import FastAPI, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
+from backend.chat_service import router as chat_router
+from backend.attack_lab import router as attack_lab_router
+from backend.network.runtime import network_runtime
 
 app = FastAPI(title="Network Anomaly Detection API")
+app.include_router(chat_router)
+app.include_router(attack_lab_router)
 
 # Enable CORS for frontend
 app.add_middleware(
@@ -307,6 +312,7 @@ def home():
         <p class="eyebrow">Major Project</p>
         <h1>Network Anomaly Detection</h1>
         <p>Upload a CSV dataset, run the trained model, and view the sampled flow prediction in a clean dashboard.</p>
+        <p><a href="/attack-lab">Network Attack Lab</a> · <a href="/dashboard">Live network dashboard</a></p>
       </div>
 
       <form class="panel" id="upload-form">
@@ -417,8 +423,19 @@ def home():
     """
 
 @app.on_event("startup")
-def startup_event():
+async def startup_event():
     load_dataset()
+    await network_runtime.start()
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await network_runtime.stop()
+
+
+@app.get("/api/network/state")
+def network_state():
+    return network_runtime.status()
 
 @app.get("/api/dataset")
 def get_dataset(page: int = 1, page_size: int = 15):

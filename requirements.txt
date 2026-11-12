@@ -6,8 +6,9 @@ seaborn
 fastapi
 uvicorn
 python-multipart
-#torch
+torch
 #torchvision
 #torchaudio
 torch-geometric
 networkx
+scapy
