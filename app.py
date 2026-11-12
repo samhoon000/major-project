@@ -10,10 +10,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 from backend.chat_service import router as chat_router
+from backend.attack_lab import router as attack_lab_router
 from backend.network.runtime import network_runtime
 
 app = FastAPI(title="Network Anomaly Detection API")
 app.include_router(chat_router)
+app.include_router(attack_lab_router)
 
 # Enable CORS for frontend
 app.add_middleware(

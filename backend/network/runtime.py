@@ -145,6 +145,7 @@ class NetworkRuntime:
             confidence = float(result["confidence"]) / 100.0
             flow.update({"gatv2_status": "analyzed", "gatv2_prediction": prediction,
                          "gatv2_confidence": confidence, "gatv2_anomaly_probability": result["anomaly_probability"],
+                         "gatv2_threshold": result["threshold"],
                          "graph_nodes": result["graph_nodes"], "graph_edges": result["graph_edges"]})
             self.analysis_count += 1
             self.anomaly_count += int(anomaly)
@@ -155,6 +156,7 @@ class NetworkRuntime:
                      "protocol": flow["protocol"], "packets": flow["total_packets"], "bytes": flow["total_bytes"],
                      "duration": flow["duration"], "prediction": prediction,
                      "gatv2_prediction": prediction, "confidence": confidence,
+                     "anomaly_probability": result["anomaly_probability"], "threshold": result["threshold"],
                      "detection_source": "GATV2", "action": "ALERT" if anomaly else "OBSERVED"}
             await chat_state.event("gatv2_analysis", event)
 
@@ -193,6 +195,7 @@ class NetworkRuntime:
                 "completed_flows": list(self.completed_flows), "gatv2": "available" if gatv2_engine._is_loaded else "unavailable",
                 "gatv2_error": None if gatv2_engine._is_loaded else "Model/scalers did not load; see server log.",
                 "gatv2_analyses": self.analysis_count, "gatv2_anomalies": self.anomaly_count,
+                "gatv2_threshold": gatv2_engine.best_threshold if gatv2_engine._is_loaded else None,
                 "latest_prediction": self.last_prediction, "pending_flows": pending,
                 "inference_window_seconds": self.inference_window}
 
