@@ -27,5 +27,6 @@ class ChatSecurityTests(unittest.TestCase):
         self.assertEqual(details["repeated_messages"], 10)
         self.assertEqual(details["unique_recipients_last_minute"], 2)
 
+
 if __name__ == "__main__":
     unittest.main()

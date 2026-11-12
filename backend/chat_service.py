@@ -3,19 +3,25 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import time
 import os
+import uuid
 from collections import defaultdict, deque
 from typing import Any
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Request
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi import HTTPException, Header
-from backend.security.behavior_analyzer import BehaviorAnalyzer, BehaviorConfig
+from backend.security.live_behavior_analyzer import BehaviorAnalyzer, BehaviorConfig
+from backend.security.message_analyzer import message_analyzer
+from backend.security.url_analyzer import url_analyzer
+from backend.security.threat_engine import threat_engine
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 SHORTENERS = {"bit.ly", "tinyurl.com", "t.co", "is.gd", "goo.gl"}
 SUSPICIOUS_WORDS = {"verify", "login", "account", "password", "urgent", "suspended", "payment"}
@@ -25,12 +31,34 @@ MAX_MESSAGE_LENGTH = 2000
 class ChatState:
     def __init__(self) -> None:
         self.clients: dict[str, WebSocket] = {}
+        self.client_ips: dict[str, str] = {}
+        self.client_endpoints: dict[str, tuple[str, int, int]] = {}
         self.blocked: set[str] = set()
         self.block_reasons: dict[str, str] = {}
         self.recent: deque[dict[str, Any]] = deque(maxlen=200)
         self.events: deque[dict[str, Any]] = deque(maxlen=500)
         self.sent: dict[str, deque[tuple[float, str, str]]] = defaultdict(deque)
         self.lock = asyncio.Lock()
+
+    def flow_matches_client(self, flow: dict[str, Any], username: str) -> bool:
+        endpoint = self.client_endpoints.get(username)
+        if not endpoint or str(flow.get("protocol", "")).upper() != "TCP":
+            return False
+        client_ip, client_port, server_port = endpoint
+        return (
+            flow.get("source_ip") == client_ip
+            and int(flow.get("source_port", -1)) == client_port
+            and int(flow.get("destination_port", -1)) == server_port
+        ) or (
+            flow.get("destination_ip") == client_ip
+            and int(flow.get("destination_port", -1)) == client_port
+            and int(flow.get("source_port", -1)) == server_port
+        )
+
+    def resolve_flow_user(self, flow: dict[str, Any]) -> str:
+        matches = [username for username in self.client_endpoints
+                   if self.flow_matches_client(flow, username)]
+        return matches[0] if len(matches) == 1 else "UNKNOWN"
 
     async def event(self, kind: str, data: dict[str, Any]) -> None:
         item = {"type": kind, "timestamp": time.time(), **data}
@@ -112,15 +140,14 @@ const events=document.getElementById('events');let messages=0,threats=0;const ws
 
 DASHBOARD_HTML = r"""<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Security Dashboard</title><style>
 body{font:14px system-ui;margin:24px auto;max-width:1200px;padding:0 18px;background:#f3f6f9;color:#17212b}h1{margin:0}h2{font-size:18px}.muted{color:#617080}.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin:18px 0}.card,section{background:#fff;border:1px solid #dbe3ea;border-radius:10px;padding:14px}.card b{display:block;font-size:23px;margin-top:4px}section{margin:14px 0;overflow:auto}table{border-collapse:collapse;width:100%;min-width:740px}th,td{text-align:left;padding:8px;border-bottom:1px solid #e7edf2}th{color:#52606e}.event{padding:7px;border-bottom:1px solid #e7edf2}input,button{padding:8px;border:1px solid #cbd5df;border-radius:6px}button{background:#126b65;color:white;cursor:pointer}</style></head><body>
-<h1>Security Admin Dashboard</h1><p class="muted">GATv2 analyzes captured network flows. The behavior analyzer detects bulk messaging. <a href="/attack-lab">Open Network Attack Lab</a></p>
-<div class="cards"><div class="card">Connected users<b id="users">0</b></div><div class="card">Messages observed<b id="messages">0</b></div><div class="card">Active flows<b id="active">0</b></div><div class="card">Packets / sec<b id="pps">0</b></div><div class="card">Bytes / sec<b id="bps">0</b></div><div class="card">Messages / sec<b id="mps">0</b></div><div class="card">GATv2 analyses<b id="analyses">0</b></div><div class="card">GATv2 anomalies<b id="anomalies">0</b></div><div class="card">Latest prediction<b id="latest">None</b></div><div class="card">Suspicious users<b id="suspicious">0</b></div><div class="card">Blocked users<b id="blocked">0</b></div><div class="card">Security events<b id="eventCount">0</b></div></div>
-<section><h2>User Security</h2><table><thead><tr><th>Username</th><th>Status</th><th>Messages</th><th>Messages/sec</th><th>Messages/30 sec</th><th>Risk</th><th>Reason</th><th>Action</th></tr></thead><tbody id="userRows"></tbody></table><p><input id="adminToken" type="password" placeholder="Admin token"> <span class="muted">Set ADMIN_TOKEN on server to enable unblock.</span></p></section>
-<section><h2>Network Security / ML Enforcement</h2><p id="latestAnalysis">Loading real capture and GATv2 state.</p><table><thead><tr><th>IP</th><th>Reason</th><th>Probability</th><th>First detected</th><th>Blocked until</th><th>Status</th><th>Action</th></tr></thead><tbody id="networkBlocks"></tbody></table></section>
-<section><h2>Live Network Flows</h2><table><thead><tr><th>Timestamp</th><th>Source</th><th>Destination</th><th>Protocol</th><th>Packets</th><th>Bytes</th><th>Duration</th><th>Packets/sec</th><th>Bytes/sec</th><th>GATv2</th><th>Probability</th></tr></thead><tbody id="flows"></tbody></table><div class="muted" id="captureStatus">Loading capture status</div></section><section><h2>Security Events</h2><div id="events"></div></section>
+<h1>Security Admin Dashboard</h1><p class="muted">GATv2 analyzes captured network flows. The behavior analyzer detects bulk messaging.</p>
+<div class="cards"><div class="card">Connected users<b id="users">0</b></div><div class="card">Recent messages<b id="messages">0</b></div><div class="card">Active flows<b id="active">0</b></div><div class="card">Packets / sec<b id="pps">0</b></div><div class="card">Bytes / sec<b id="bps">0</b></div><div class="card">Messages / sec<b id="mps">0</b></div><div class="card">GATv2 analyses<b id="analyses">0</b></div><div class="card">GATv2 anomalies<b id="anomalies">0</b></div><div class="card">Latest prediction<b id="latest">None</b></div><div class="card">Suspicious users<b id="suspicious">0</b></div><div class="card">Blocked users<b id="blocked">0</b></div><div class="card">Recent events<b id="eventCount">0</b></div></div>
+<section><h2>User Security</h2><table><thead><tr><th>Username</th><th>IP</th><th>Status</th><th>Messages</th><th>Messages/sec</th><th>Messages/30 sec</th><th>Risk</th><th>Reason</th><th>Action</th></tr></thead><tbody id="userRows"></tbody></table><p><input id="adminToken" type="password" placeholder="Admin token"> <span class="muted">Set ADMIN_TOKEN on server to enable unblock.</span></p></section>
+<section><h2>Live Network Flows</h2><table><thead><tr><th>Timestamp</th><th>User</th><th>Source</th><th>Destination</th><th>Protocol</th><th>Packets</th><th>Bytes</th><th>Duration</th><th>Packets/sec</th><th>Bytes/sec</th><th>GATv2</th><th>Confidence</th></tr></thead><tbody id="flows"></tbody></table><div class="muted" id="captureStatus">Loading capture status</div></section><section><h2>Security Events</h2><div id="events"></div></section>
 <script>
-const missingDashboardElements=new Set();const $=id=>{const element=document.getElementById(id);if(element)return element;if(!missingDashboardElements.has(id)){console.warn(`Dashboard element #${id} is missing`);missingDashboardElements.add(id)}return {textContent:"",innerHTML:"",value:"",disabled:true}};let ev=[],analyses=0,anomalies=0;const ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws/dashboard`);ws.onmessage=e=>{const x=JSON.parse(e.data);if(x.type==='snapshot'){ev=x.events||[];renderEvents();return}ev.unshift(x);ev=ev.slice(0,150);renderEvents();refresh()};function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function renderEvents(){analyses=ev.filter(x=>x.type==='gatv2_analysis').length;anomalies=ev.filter(x=>x.type==='gatv2_analysis'&&x.gatv2_prediction==='ATTACK').length;$('events').innerHTML=ev.slice(0,80).map(x=>`<div class="event"><b>${new Date((x.timestamp||0)*1000).toLocaleTimeString()}</b> · ${esc(x.type)} · ${esc(x.username||x.sender||x.source_ip||'')} · ${esc(x.reason||x.gatv2_prediction||x.text||'')} · ${esc(x.detection_source||'')}</div>`).join('');$('eventCount').textContent=ev.filter(x=>['blocked','threat','gatv2_analysis','network_flow'].includes(x.type)).length;$('analyses').textContent=analyses;$('anomalies').textContent=anomalies}
-async function refresh(){try{const [c,n]=await Promise.all([fetch('/api/chat/state').then(r=>r.json()),fetch('/api/network/state').then(r=>r.json())]);$('users').textContent=c.users.length;$('messages').textContent=c.messages;$('mps').textContent=c.messages_per_second;$('blocked').textContent=c.blocked.length;$('active').textContent=n.active_flows.length;$('pps').textContent=n.packets_per_second;$('bps').textContent=n.bytes_per_second;$('latest').textContent=(ev.find(x=>x.type==='gatv2_analysis')||{}).gatv2_prediction||'None';$('suspicious').textContent=Object.values(c.behavior).filter(x=>x.risk==='SUSPICIOUS'||x.risk==='BLOCK').length;$('userRows').innerHTML=Object.entries(c.behavior).map(([u,b])=>`<tr><td>${esc(u)}</td><td>${c.blocked.includes(u)?'BLOCKED':c.users.includes(u)?'ONLINE':'OFFLINE'}</td><td>${b.total_messages}</td><td>${b.messages_per_second}</td><td>${b.messages_last_30_seconds}</td><td>${esc(b.risk)}</td><td>${esc(c.block_reasons[u]||'—')}</td><td>${c.blocked.includes(u)?`<button onclick="unblock('${esc(u)}')">Unblock</button>`:'—'}</td></tr>`).join('');const fs=[...n.active_flows,...n.completed_flows].slice(-100).reverse();$('flows').innerHTML=fs.map(f=>`<tr><td>${new Date((f.last_seen||0)*1000).toLocaleTimeString()}</td><td>${esc(f.source_ip)}:${f.source_port}</td><td>${esc(f.destination_ip)}:${f.destination_port}</td><td>${esc(f.protocol)}</td><td>${f.total_packets}</td><td>${f.total_bytes}</td><td>${Number(f.duration).toFixed(2)}s</td><td>${Number(f.packets_per_second).toFixed(2)}</td><td>${Number(f.bytes_per_second).toFixed(2)}</td><td>${esc(f.gatv2_prediction||f.gatv2_status||'pending')}</td><td>${f.gatv2_anomaly_probability==null?'—':(f.gatv2_anomaly_probability*100).toFixed(1)+'%'}</td></tr>`).join('');$('captureStatus').textContent=`Capture: ${n.capture} · Interface: ${n.interface||'not selected'} · ${n.capture_error||''} · GATv2: ${n.gatv2}${n.gatv2_error?' · '+n.gatv2_error:''}`;renderEvents()}catch(e){$('captureStatus').textContent='Dashboard API unavailable: '+e}}
-async function unblock(user){const r=await fetch('/api/admin/unblock/'+encodeURIComponent(user),{method:'POST',headers:{'X-Admin-Token':$('adminToken').value}});alert(r.ok?`${user} unblocked`:((await r.json()).detail||'Unblock failed'));refresh()}async function unblockNetwork(ip){const r=await fetch('/api/admin/network-unblock/'+encodeURIComponent(ip),{method:'POST',headers:{'X-Admin-Token':$('adminToken').value}});alert(r.ok?`${ip} unblocked`:((await r.json()).detail||'Unblock failed'));refresh()}async function networkRefresh(){try{const n=await fetch('/api/network/state').then(r=>r.json());const f=n.latest_analysis;$('latestAnalysis').textContent=f?`${f.gatv2_prediction} · probability ${Number(f.gatv2_anomaly_probability).toFixed(4)} · threshold ${Number(f.gatv2_threshold).toFixed(4)} · ${f.source_ip}:${f.source_port} → ${f.destination_ip}:${f.destination_port} · ${f.protocol} · flow ${f.flow_id}`:`GATv2 ${n.gatv2}: ${n.gatv2_error||'waiting for a finalized flow'}`;$('networkBlocks').innerHTML=n.blocked_sources.map(b=>`<tr><td>${esc(b.source_ip)}</td><td>${esc(b.reason)}</td><td>${Number(b.anomaly_probability).toFixed(4)}</td><td>${new Date(b.first_detected*1000).toLocaleString()}</td><td>${new Date(b.blocked_until*1000).toLocaleString()}</td><td>${esc(b.status)}</td><td>${b.status==='BLOCKED'?`<button onclick="unblockNetwork('${esc(b.source_ip)}')">Unblock</button>`:'—'}</td></tr>`).join('')}catch(e){}}setInterval(()=>{refresh();networkRefresh()},2000);refresh();networkRefresh();
+const $=id=>document.getElementById(id);let ev=[];const ws=new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws/dashboard`);ws.onmessage=e=>{const x=JSON.parse(e.data);if(x.type==='snapshot'){ev=x.events||[];renderEvents();return}ev.unshift(x);ev=ev.slice(0,150);renderEvents();refresh()};function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function renderEvents(){$('events').innerHTML=ev.slice(0,80).map(x=>`<div class="event"><b>${new Date((x.timestamp||0)*1000).toLocaleTimeString()}</b> · ${esc(x.type)} · ${esc(x.username||x.sender||x.source_ip||'')} · ${esc(x.reason||x.gatv2_prediction||x.text||'')} · ${esc(x.detection_source||'')}</div>`).join('');$('eventCount').textContent=ev.length}
+async function refresh(){try{const [c,n]=await Promise.all([fetch('/api/chat/state').then(r=>r.json()),fetch('/api/network/state').then(r=>r.json())]);$('users').textContent=c.users.length;$('messages').textContent=c.messages;$('mps').textContent=c.messages_per_second;$('blocked').textContent=c.blocked.length;$('active').textContent=n.active_flows.length;$('pps').textContent=n.packets_per_second;$('bps').textContent=n.bytes_per_second;$('analyses').textContent=n.gatv2_analyses;$('anomalies').textContent=n.gatv2_anomalies;$('latest').textContent=n.latest_prediction||'None';$('suspicious').textContent=Object.values(c.behavior).filter(x=>x.risk==='SUSPICIOUS'||x.risk==='BLOCK').length;$('userRows').innerHTML=Object.entries(c.behavior).map(([u,b])=>`<tr><td>${esc(u)}</td><td>${esc(c.client_ips[u]||'UNKNOWN')}</td><td>${c.blocked.includes(u)?'BLOCKED':c.users.includes(u)?'ONLINE':'OFFLINE'}</td><td>${b.total_messages}</td><td>${b.messages_per_second}</td><td>${b.messages_last_30_seconds}</td><td>${esc(b.risk)}</td><td>${esc(c.block_reasons[u]||'—')}</td><td>${c.blocked.includes(u)?`<button onclick="unblock('${esc(u)}')">Unblock</button>`:'—'}</td></tr>`).join('');const fs=[...n.active_flows,...n.completed_flows].slice(-100).reverse();$('flows').innerHTML=fs.map(f=>`<tr><td>${new Date((f.last_seen||0)*1000).toLocaleTimeString()}</td><td>${esc(f.username||'UNKNOWN')}</td><td>${esc(f.source_ip)}:${f.source_port}</td><td>${esc(f.destination_ip)}:${f.destination_port}</td><td>${esc(f.protocol)}</td><td>${f.total_packets}</td><td>${f.total_bytes}</td><td>${Number(f.duration).toFixed(2)}s</td><td>${Number(f.packets_per_second).toFixed(2)}</td><td>${Number(f.bytes_per_second).toFixed(2)}</td><td>${esc(f.gatv2_prediction||f.gatv2_status||'pending')}</td><td>${f.gatv2_confidence==null?'—':(f.gatv2_confidence*100).toFixed(1)+'%'}</td></tr>`).join('');$('captureStatus').textContent=`Capture: ${n.capture} · Interface: ${n.interface||'not selected'} · ${n.capture_error||''} · GATv2: ${n.gatv2}${n.gatv2_error?' · '+n.gatv2_error:''}`;renderEvents()}catch(e){$('captureStatus').textContent='Dashboard API unavailable: '+e}}
+async function unblock(user){const r=await fetch('/api/admin/unblock/'+encodeURIComponent(user),{method:'POST',headers:{'X-Admin-Token':$('adminToken').value}});alert(r.ok?`${user} unblocked`:((await r.json()).detail||'Unblock failed'));refresh()}setInterval(refresh,2000);refresh();
 </script></body></html>"""
 
 
@@ -136,10 +163,7 @@ async def chat_page() -> str:
 
 
 @router.get("/dashboard", response_class=HTMLResponse)
-async def dashboard_page(request: Request) -> str:
-    from backend.network.runtime import network_runtime
-    if request.client:
-        network_runtime.enforcement.admin_ips.add(request.client.host)
+async def dashboard_page() -> str:
     return DASHBOARD_HTML
 
 
@@ -152,6 +176,7 @@ async def chat_state() -> dict:
                                        "unique_recipients": 0, "risk": "SAFE"})
     now = time.time()
     return {"users": sorted(state.clients), "blocked": sorted(state.blocked), "block_reasons": state.block_reasons,
+            "client_ips": dict(state.client_ips),
             "behavior": behavior, "messages": len(state.recent),
             "messages_per_second": sum(now - item.get("timestamp", 0) <= 1 for item in state.recent),
             "messages_last_30_seconds": sum(now - item.get("timestamp", 0) <= 30 for item in state.recent),
@@ -162,9 +187,6 @@ async def chat_state() -> dict:
 async def dashboard_socket(ws: WebSocket) -> None:
     await ws.accept()
     dashboard_clients.add(ws)
-    from backend.network.runtime import network_runtime
-    if ws.client:
-        network_runtime.enforcement.admin_ips.add(ws.client.host)
     await ws.send_json({"type": "snapshot", "users": sorted(state.clients), "blocked": sorted(state.blocked), "events": list(state.events), "block_reasons": state.block_reasons})
     try:
         while True:
@@ -188,22 +210,6 @@ async def unblock_user(user_id: str, x_admin_token: str | None = Header(default=
     return {"status": "unblocked", "username": user_id}
 
 
-@router.post("/api/admin/network-unblock/{source_ip}")
-async def unblock_network_source(source_ip: str, x_admin_token: str | None = Header(default=None)) -> dict:
-    token = os.getenv("ADMIN_TOKEN")
-    if not token or x_admin_token != token:
-        raise HTTPException(status_code=403, detail="Admin token is missing or invalid; configure ADMIN_TOKEN.")
-    from backend.network.runtime import network_runtime
-    try:
-        block = network_runtime.enforcement.unblock(source_ip)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid source IP address.")
-    if block is None:
-        raise HTTPException(status_code=404, detail="Source is not currently blocked.")
-    await state.event("BLOCK_UNBLOCKED", {**block.__dict__, "action": "ADMIN_UNBLOCK"})
-    return {"status": block.status, "source_ip": block.source_ip}
-
-
 @router.websocket("/ws/chat/{username}")
 async def chat_socket(ws: WebSocket, username: str) -> None:
     username = username.strip()
@@ -219,8 +225,13 @@ async def chat_socket(ws: WebSocket, username: str) -> None:
         return
     await ws.accept()
     client_ip = ws.client.host if ws.client else "unknown"
+    client_port = int(ws.client.port) if ws.client else 0
+    server = ws.scope.get("server") or (None, int(os.getenv("PORT", "8000")))
+    server_port = int(server[1]) if len(server) > 1 and server[1] else int(os.getenv("PORT", "8000"))
     async with state.lock:
         state.clients[username] = ws
+        state.client_ips[username] = client_ip
+        state.client_endpoints[username] = (client_ip, client_port, server_port)
     await state.roster()
     await state.event("user_joined", {"username": username})
     try:
@@ -237,19 +248,75 @@ async def chat_socket(ws: WebSocket, username: str) -> None:
                 await ws.send_json({"type": "blocked", "message": "Your account is blocked."})
                 break
             behavior, behavior_details = behavior_risk(username, recipient, text)
+            message_id = uuid.uuid4().hex
+            message_analysis = message_analyzer.analyze(text)
+            url_analysis = url_analyzer.analyze(text)
             security = inspect_message(text)
-            record = {"sender": username, "recipient": recipient, "source_ip": client_ip, "text": text, "security": security, "behavior": behavior_details}
-            if security["suspicious_url"]:
-                await ws.send_json({"type": "warning", "message": "Message blocked: URL has multiple suspicious indicators."})
-                await state.event("message_blocked", {**record, "reason": "suspicious_url"})
-                continue
-            if behavior >= 1.0:
+            network_analysis = None
+            try:
+                # Runtime import avoids the existing runtime -> chat service import cycle.
+                from backend.network.runtime import network_runtime
+                matching_flows = [f for f in reversed(network_runtime.completed_flows)
+                                  if state.flow_matches_client(f, username)]
+                candidates = [f for f in matching_flows if f.get("gatv2_status") == "analyzed"]
+                if candidates:
+                    latest = candidates[0]
+                    network_analysis = {"available": True,
+                                        "flow_id": latest.get("flow_id"),
+                                        "anomaly_probability": latest.get("gatv2_anomaly_probability"),
+                                        "is_anomaly": latest.get("gatv2_prediction") == "ATTACK",
+                                        "confidence": float(latest.get("gatv2_confidence", 0.0)) * 100}
+                    network_association_reason = "matched_exact_chat_tcp_5_tuple"
+                elif matching_flows:
+                    network_association_reason = "matching_chat_flow_not_yet_analyzed"
+                elif any(state.flow_matches_client(f, username)
+                         for f in network_runtime.tracker.active_snapshots()):
+                    network_association_reason = "matching_chat_flow_still_active"
+                else:
+                    network_association_reason = "no_captured_flow_matched_chat_tcp_5_tuple"
+            except Exception:
+                network_analysis = None
+                network_association_reason = "network_runtime_unavailable_or_association_failed"
+            decision = await threat_engine.evaluate_message_event(
+                username, client_ip,
+                {**message_analysis, "indicators": message_analysis.get("indicators", [])},
+                {**url_analysis, "indicators": url_analysis.get("indicators", [])},
+                {"behavior_risk": behavior, "indicators": [behavior_details.get("risk", "SAFE")],
+                 **behavior_details},
+                network_analysis,
+            )
+            record = {"message_id": message_id, "sender": username, "recipient": recipient, "source_ip": client_ip,
+                      "text": text, "security": security, "behavior": behavior_details,
+                      "threat": decision, "network_association_reason": network_association_reason}
+            signals = decision.get("signals", {})
+            logger.info(
+                "THREAT_DECISION user=%s message_id=%s message_risk=%.4f url_risk=%.4f "
+                "behavior_risk=%.4f network_risk=%.4f network_signal_available=%s "
+                "network_flow_id=%s network_association=%s final_risk=%.4f decision=%s",
+                username, message_id, float(signals.get("message_risk", 0.0)),
+                float(signals.get("url_risk", 0.0)), float(signals.get("behavior_risk", 0.0)),
+                float(signals.get("gatv2_network_risk", 0.0)),
+                decision.get("network_signal_available", False),
+                (network_analysis or {}).get("flow_id", "none"), network_association_reason,
+                float(decision.get("final_risk", decision.get("threat_score", 0.0))), decision.get("action", "UNKNOWN"),
+            )
+            await state.event("threat_decision", {**decision, "sender": username,
+                                                   "recipient": recipient, "message_id": message_id,
+                                                   "network_flow_id": (network_analysis or {}).get("flow_id"),
+                                                   "network_association_reason": network_association_reason})
+            if decision["action"] == "BLOCK_USER":
                 state.blocked.add(username)
-                state.block_reasons[username] = "Bulk message flooding"
+                state.block_reasons[username] = decision["reason"]
                 await ws.send_json({"type": "blocked", "message": "Your account has been temporarily blocked due to suspicious activity."})
-                await state.event("blocked", {"username": username, "source_ip": client_ip, "reason": "Bulk message flooding", "threat_type": "BULK_MESSAGE_FLOOD", "detection_source": "BEHAVIOR", "risk": "HIGH", "behavior": behavior_details})
+                await state.event("blocked", {"username": username, "source_ip": client_ip,
+                                               "reason": decision["reason"], "threat": decision})
+                await state.roster()
                 await ws.close(code=1008)
                 break
+            if decision["action"] == "BLOCK_MESSAGE":
+                await ws.send_json({"type": "warning", "message": "Message rejected by the security policy.", "threat": decision})
+                await state.event("message_blocked", {**record, "reason": decision["reason"]})
+                continue
             peer = state.clients.get(recipient)
             if not peer:
                 await ws.send_json({"type": "warning", "message": "Recipient is not connected."})
@@ -259,14 +326,15 @@ async def chat_socket(ws: WebSocket, username: str) -> None:
             await ws.send_json(delivered)
             await peer.send_json(delivered)
             await state.event("message", record)
-            if behavior >= 0.5:
-                await ws.send_json({"type": "warning", "message": "Unusually rapid or repetitive messages detected."})
-                await state.event("threat", {"sender": username, "recipient": recipient, "reason": "Bulk message behavior warning", "threat_type": "BULK_MESSAGE_BEHAVIOR", "detection_source": "BEHAVIOR", "risk": "MEDIUM", "behavior": behavior_details})
+            if decision["action"] == "WARN":
+                await ws.send_json({"type": "warning", "message": decision["reason"], "threat": decision})
     except WebSocketDisconnect:
         pass
     finally:
         async with state.lock:
             if state.clients.get(username) is ws:
                 state.clients.pop(username, None)
+                state.client_ips.pop(username, None)
+                state.client_endpoints.pop(username, None)
         await state.roster()
         await state.event("user_left", {"username": username})

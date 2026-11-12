@@ -1,4 +1,4 @@
-"""Coordinates capture, flow expiry, and truthful network status reporting."""
+"""Owns live capture, flow expiry and batched GATv2 inference."""
 from __future__ import annotations
 
 import asyncio
@@ -7,25 +7,13 @@ import os
 import threading
 import time
 from collections import deque
-from threading import Lock
 
+from backend.chat_service import state as chat_state
 from backend.network.capture import PacketCapture
 from backend.network.flow_tracker import FlowTracker
-from backend.network.gatv2_inference import GATv2Inference
-from backend.network.enforcement import QuarantineManager
+from backend.network.gatv2_inference import gatv2_engine
 
 log = logging.getLogger(__name__)
-
-
-def build_attack_event(flow: dict, result: dict, timestamp: float | None = None) -> dict:
-    probability, threshold = result["anomaly_probability"], result["threshold"]
-    return {"flow_id": flow["flow_id"], "source_ip": flow["source_ip"],
-            "destination_ip": flow["destination_ip"], "source_port": flow["source_port"],
-            "destination_port": flow["destination_port"], "protocol": flow["protocol"],
-            "anomaly_probability": probability, "threshold": threshold,
-            "prediction": result["prediction"], "gatv2_prediction": result["prediction"],
-            "reason": f"GATv2 {result['prediction']} probability={probability:.6f} threshold={threshold:.6f}",
-            "timestamp": timestamp if timestamp is not None else time.time()}
 
 
 class NetworkRuntime:
@@ -33,130 +21,180 @@ class NetworkRuntime:
         self.loop = None
         self.capture = None
         self._capture_bootstrap = None
-        self.tracker = FlowTracker(float(os.getenv("FLOW_IDLE_TIMEOUT", "15")), float(os.getenv("FLOW_MAX_DURATION", "120")), self._finalized)
-        self.flows = deque(maxlen=300)
-        self.pending = deque()
-        self.inference = GATv2Inference()
-        self.enforcement = QuarantineManager()
+        self._worker = None
+        self._pending: list[dict] = []
+        self._pending_lock = threading.Lock()
+        self._stats_lock = threading.Lock()
+        self._recent_packets = deque()
         self.packet_count = 0
         self.byte_count = 0
-        self.recent_packets = deque()
-        self._traffic_lock = Lock()
-        self._expire_task = None
+        self.last_prediction = None
+        self.analysis_count = 0
+        self.anomaly_count = 0
+        self.completed_flows = deque(maxlen=300)
+        self.started_at = time.monotonic()
+        self.inference_window = float(os.getenv("GATV2_INFERENCE_WINDOW_SECONDS", "5"))
+        self.tracker = FlowTracker(
+            idle_timeout=float(os.getenv("FLOW_IDLE_TIMEOUT", "15")),
+            max_duration=float(os.getenv("FLOW_MAX_DURATION", "120")),
+            on_finalize=self._finalized,
+        )
 
-    def _packet(self, packet: dict):
-        with self._traffic_lock:
-            self.packet_count += 1
-            self.byte_count += packet["packet_length"]
-            self.recent_packets.append((packet["timestamp"], packet["packet_length"]))
-        self.tracker.add_packet(packet["source_ip"], packet["destination_ip"], packet["source_port"], packet["destination_port"], packet["protocol"], packet["packet_length"], packet["timestamp"], packet.get("tcp_flags"))
-
-    def _finalized(self, flow: dict):
-        flow["features"] = self.tracker.features(flow)
-        flow["gatv2_status"] = "unavailable"
-        flow["gatv2_prediction"] = None
-        flow["gatv2_anomaly_probability"] = None
-        self.flows.append(flow)
-        self.pending.append(flow)
-        log.info("[FLOW] Flow finalized id=%s packets=%s", flow["flow_id"], flow["total_packets"])
-        if self.loop and self.loop.is_running():
-            from backend.chat_service import state
-            self.loop.call_soon_threadsafe(lambda: asyncio.create_task(state.event("network_flow", flow)))
-
-    async def start(self):
+    async def start(self) -> None:
+        if self._worker and not self._worker.done():
+            return
         self.loop = asyncio.get_running_loop()
-        self.capture = PacketCapture(self._packet)
+        interface = os.getenv("NETWORK_INTERFACE") or os.getenv("CAPTURE_INTERFACE")
+        self.capture = PacketCapture(self._packet, interface=interface)
+        # Windows adapter discovery may be slow; do not block FastAPI startup or chat.
         self._capture_bootstrap = threading.Thread(target=self.capture.start, name="capture-bootstrap", daemon=True)
         self._capture_bootstrap.start()
-        self._expire_task = asyncio.create_task(self._expire_loop())
+        self._worker = asyncio.create_task(self._run(), name="network-inference-worker")
+        log.info("[CAPTURE] Startup requested interface=%s filter=%s", interface or "<unset>", self.capture.bpf_filter)
 
-    async def _expire_loop(self):
+    def _packet(self, packet: dict) -> None:
+        timestamp = float(packet["timestamp"])
+        length = int(packet["packet_length"])
+        with self._stats_lock:
+            self.packet_count += 1
+            self.byte_count += length
+            self._recent_packets.append((timestamp, length))
+            cutoff = timestamp - 1.0
+            while self._recent_packets and self._recent_packets[0][0] < cutoff:
+                self._recent_packets.popleft()
+        flow = self.tracker.add_packet(
+            packet["source_ip"], packet["destination_ip"], packet["source_port"],
+            packet["destination_port"], packet["protocol"], length, timestamp,
+            packet.get("tcp_flags"),
+        )
+        if flow["total_packets"] == 1:
+            self._schedule_event("flow_started", {**flow, "username": self._resolve_user(flow)})
+
+    def _resolve_user(self, flow: dict) -> str:
+        return chat_state.resolve_flow_user(flow)
+
+    def _finalized(self, flow: dict) -> None:
+        flow["features"] = self.tracker.features(flow)
+        flow["username"] = self._resolve_user(flow)
+        flow["gatv2_status"] = "pending"
+        flow["gatv2_prediction"] = None
+        flow["gatv2_confidence"] = None
+        self.completed_flows.append(flow)
+        with self._pending_lock:
+            self._pending.append(flow)
+        log.info("[FLOW] Finalized %s packets=%d bytes=%d", flow["flow_id"], flow["total_packets"], flow["total_bytes"])
+        self._schedule_event("flow_completed", flow)
+
+    def _schedule_event(self, kind: str, payload: dict) -> None:
+        if self.loop and self.loop.is_running():
+            self.loop.call_soon_threadsafe(lambda: asyncio.create_task(chat_state.event(kind, payload)))
+
+    async def _run(self) -> None:
+        last_batch = time.monotonic()
         try:
             while True:
                 await asyncio.sleep(1)
                 self.tracker.expire()
-                for block in self.enforcement.expire():
-                    await self._publish("BLOCK_EXPIRED", block.__dict__)
-                if self.pending and self.inference.available:
-                    batch = [self.pending.popleft() for _ in range(min(16, len(self.pending)))]
-                    try:
-                        results = await asyncio.to_thread(self.inference.analyze, batch)
-                        by_id = {result["flow_id"]: result for result in results}
-                        for flow in batch:
-                            result = by_id[flow["flow_id"]]
-                            flow.update({"gatv2_status": "analyzed", "gatv2_prediction": result["prediction"],
-                                         "gatv2_anomaly_probability": result["anomaly_probability"],
-                                         "gatv2_threshold": result["threshold"],
-                                         "node_features": result["node_features"], "edge_features": result["edge_features"],
-                                         "node_model_features": result["node_model_features"],
-                                         "edge_model_features": result["edge_model_features"],
-                                         "graph_node_count": result["graph_node_count"], "graph_edge_count": result["graph_edge_count"]})
-                            analysis = {**flow, "capture_interface": self.capture.interface if self.capture else None,
-                                        "timestamp": flow["last_seen"], "detection_source": "GATV2"}
-                            await self._publish("gatv2_analysis", analysis)
-                            if result["prediction"] == "ATTACK":
-                                attack = build_attack_event(flow, result)
-                                await self._publish("GATV2_ATTACK_DETECTED", attack)
-                                try:
-                                    block, action = self.enforcement.handle_attack(attack)
-                                    await self._publish("BLOCK_APPLIED" if action == "BLOCK_APPLIED" else "enforcement_decision",
-                                                        {**attack, "action": action, "reason": action,
-                                                         "block": block.__dict__ if block else None})
-                                except Exception as exc:
-                                    log.exception("[ENFORCEMENT] Unable to apply quarantine")
-                                    await self._publish("enforcement_error", {**attack, "action": "BLOCK_FAILED", "error": str(exc)})
-                    except Exception as exc:
-                        log.exception("[GATV2] live inference failed")
-                        self.inference.available = False
-                        self.inference.error = str(exc)
-                        for flow in batch:
-                            flow["gatv2_status"] = "unavailable"
-                            flow["gatv2_error"] = str(exc)
-                            await self._publish("gatv2_unavailable", {"flow_id": flow["flow_id"], "error": str(exc)})
+                now = time.monotonic()
+                if now - last_batch >= self.inference_window:
+                    batch = self._take_pending()
+                    if batch:
+                        await self._analyze(batch)
+                    last_batch = now
         except asyncio.CancelledError:
-            pass
+            return
 
-    async def _publish(self, kind, event):
-        from backend.chat_service import state
-        await state.event(kind, event)
+    def _take_pending(self) -> list[dict]:
+        with self._pending_lock:
+            batch, self._pending = self._pending, []
+        return batch
 
-    async def stop(self):
-        if self._expire_task:
-            self._expire_task.cancel()
-            await asyncio.gather(self._expire_task, return_exceptions=True)
+    async def _analyze(self, flows: list[dict]) -> None:
+        if not getattr(gatv2_engine, "_is_loaded", False):
+            error = "GATv2 model or preprocessing artifacts are unavailable; no prediction was produced."
+            for flow in flows:
+                flow["gatv2_status"] = "unavailable"
+            await chat_state.event("gatv2_unavailable", {"error": error, "flow_ids": [f["flow_id"] for f in flows]})
+            return
+
+        inputs = []
+        for flow in flows:
+            edge = flow["features"]
+            inputs.append({
+                "flow_id": flow["flow_id"], "src_ip": flow["source_ip"], "dst_ip": flow["destination_ip"],
+                "src_port": flow["source_port"], "dst_port": flow["destination_port"],
+                "protocol": flow["protocol"], "duration": edge["Flow Duration"],
+                "fwd_packets": edge["Total Fwd Packets"], "bwd_packets": edge["Total Backward Packets"],
+                "flow_bytes_s": edge["Flow Bytes/s"], "flow_packets_s": edge["Flow Packets/s"],
+            })
+        try:
+            results = await asyncio.to_thread(gatv2_engine.predict_flows, inputs)
+            if len(results) != len(flows):
+                raise RuntimeError(f"GATv2 returned {len(results)} results for {len(flows)} flows")
+        except Exception as exc:
+            log.exception("[GATV2] Inference failed")
+            for flow in flows:
+                flow["gatv2_status"] = "unavailable"
+                flow["gatv2_error"] = str(exc)
+            await chat_state.event("gatv2_unavailable", {"error": str(exc), "flow_ids": [f["flow_id"] for f in flows]})
+            return
+
+        for flow, result in zip(flows, results):
+            anomaly = bool(result["is_anomaly"])
+            prediction = "ATTACK" if anomaly else "BENIGN"
+            confidence = float(result["confidence"]) / 100.0
+            flow.update({"gatv2_status": "analyzed", "gatv2_prediction": prediction,
+                         "gatv2_confidence": confidence, "gatv2_anomaly_probability": result["anomaly_probability"],
+                         "graph_nodes": result["graph_nodes"], "graph_edges": result["graph_edges"]})
+            self.analysis_count += 1
+            self.anomaly_count += int(anomaly)
+            self.last_prediction = prediction
+            event = {"flow_id": flow["flow_id"], "username": flow["username"],
+                     "source_ip": flow["source_ip"], "destination_ip": flow["destination_ip"],
+                     "source_port": flow["source_port"], "destination_port": flow["destination_port"],
+                     "protocol": flow["protocol"], "packets": flow["total_packets"], "bytes": flow["total_bytes"],
+                     "duration": flow["duration"], "prediction": prediction,
+                     "gatv2_prediction": prediction, "confidence": confidence,
+                     "detection_source": "GATV2", "action": "ALERT" if anomaly else "OBSERVED"}
+            await chat_state.event("gatv2_analysis", event)
+
+    async def stop(self) -> None:
         if self.capture:
             await asyncio.to_thread(self.capture.stop)
         if self._capture_bootstrap and self._capture_bootstrap.is_alive():
-            self._capture_bootstrap.join(timeout=1.0)
+            await asyncio.to_thread(self._capture_bootstrap.join, 1.0)
+        if self._worker:
+            self._worker.cancel()
+            await asyncio.gather(self._worker, return_exceptions=True)
+            self._worker = None
         self.tracker.expire(force=True)
-        for block in self.enforcement.expire():
-            await self._publish("BLOCK_EXPIRED", block.__dict__)
-        for block in self.enforcement.close():
-            await self._publish("BLOCK_SHUTDOWN_CLEANUP", block.__dict__)
+        pending = self._take_pending()
+        if pending:
+            await self._analyze(pending)
 
-    def status(self):
+    def status(self) -> dict:
         now = time.time()
-        with self._traffic_lock:
-            while self.recent_packets and self.recent_packets[0][0] < now - 1.0:
-                self.recent_packets.popleft()
-            packets_per_second = len(self.recent_packets)
-            bytes_per_second = sum(length for _, length in self.recent_packets)
-        return {"capture": "running" if self.capture and self.capture._thread and self.capture._thread.is_alive() else "unavailable",
-                "capture_error": self.capture.error if self.capture else "not started",
+        with self._stats_lock:
+            recent = [(ts, size) for ts, size in self._recent_packets if now - ts <= 1.0]
+            pps = len(recent)
+            bps = sum(size for _, size in recent)
+        capture_state = "unavailable"
+        if self._capture_bootstrap and self._capture_bootstrap.is_alive():
+            capture_state = "starting"
+        elif self.capture and self.capture._thread and self.capture._thread.is_alive() and not self.capture.error:
+            capture_state = "running"
+        with self._pending_lock:
+            pending = len(self._pending)
+        return {"capture": capture_state, "capture_error": self.capture.error if self.capture else "not started",
                 "interface": self.capture.interface if self.capture else None,
-                "capture_filter": self.capture.bpf_filter if self.capture else "",
-                "packets": self.packet_count, "bytes": self.byte_count,
-                "packets_per_second": packets_per_second,
-                "bytes_per_second": bytes_per_second,
-                "active_flows": self.tracker.active_snapshots(),
-                "completed_flows": list(self.flows), "gatv2": "available" if self.inference.available else "unavailable",
-                "gatv2_error": self.inference.error,
-                "analyses": sum(flow.get("gatv2_status") == "analyzed" for flow in self.flows),
-                "attack_predictions": sum(flow.get("gatv2_prediction") == "ATTACK" for flow in self.flows),
-                "latest_analysis": next((flow for flow in reversed(self.flows) if flow.get("gatv2_status") == "analyzed"), None),
-                "threshold": getattr(self.inference, "threshold", None),
-                "server_ips": sorted(self.enforcement.protected_ips),
-                "blocked_sources": self.enforcement.snapshot()}
+                "capture_filter": self.capture.bpf_filter if self.capture else None,
+                "packets": self.packet_count, "bytes": self.byte_count, "packets_per_second": pps,
+                "bytes_per_second": bps, "active_flows": self.tracker.active_snapshots(),
+                "completed_flows": list(self.completed_flows), "gatv2": "available" if gatv2_engine._is_loaded else "unavailable",
+                "gatv2_error": None if gatv2_engine._is_loaded else "Model/scalers did not load; see server log.",
+                "gatv2_analyses": self.analysis_count, "gatv2_anomalies": self.anomaly_count,
+                "latest_prediction": self.last_prediction, "pending_flows": pending,
+                "inference_window_seconds": self.inference_window}
 
 
 network_runtime = NetworkRuntime()

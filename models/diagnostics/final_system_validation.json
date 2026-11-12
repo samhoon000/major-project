@@ -1,0 +1,156 @@
+{
+  "status": "PARTIALLY COMPLETE",
+  "model": {
+    "architecture": "Existing GATv2",
+    "active_checkpoint": "models/gatv2_model.pth",
+    "loaded_at_startup": true,
+    "training_performed": false,
+    "checkpoint_modified": false,
+    "production_candidate_promoted": false
+  },
+  "runtime": {
+    "host": "192.168.1.100",
+    "port": 8001,
+    "chat_url": "http://192.168.1.100:8001/chat",
+    "dashboard_url": "http://192.168.1.100:8001/dashboard",
+    "network_api": "GET /api/network/state",
+    "capture_interface": "\\Device\\NPF_{1F341169-C1D1-4BBE-8C0D-3E33B9534E0C}",
+    "capture_filter": "ip and (tcp or udp)"
+  },
+  "npcap": {
+    "status": "VERIFIED",
+    "service_running": true,
+    "capture_dlls_present": true,
+    "scapy_capture_working": true,
+    "evidence": "Npcap service and DLLs were verified; live API reports capture running on the Wi-Fi NPF interface."
+  },
+  "live_api": {
+    "status": "VERIFIED",
+    "sample_interval_seconds": 6,
+    "first": {
+      "packets": 3436,
+      "bytes": 2244324,
+      "active_flows": 42,
+      "completed_flows": 201,
+      "gatv2_analyses": 199,
+      "gatv2_anomalies": 0
+    },
+    "second": {
+      "packets": 3452,
+      "bytes": 2247206,
+      "active_flows": 41,
+      "completed_flows": 208,
+      "gatv2_analyses": 203,
+      "gatv2_anomalies": 0
+    },
+    "observed_delta": {
+      "packets": 16,
+      "bytes": 2882,
+      "completed_flows": 7,
+      "gatv2_analyses": 4
+    }
+  },
+  "live_flow_graph_gatv2": {
+    "status": "VERIFIED",
+    "evidence_source": "Scapy/Npcap live capture, FlowTracker, live inference response",
+    "sample_flow": {
+      "flow_id": "6cdd3451240545829edfd65def291a90",
+      "source_ip": "192.168.1.100",
+      "destination_ip": "103.89.233.250",
+      "source_port": 55056,
+      "destination_port": 53,
+      "protocol": "UDP",
+      "packet_count": 4,
+      "bytes": 504,
+      "duration_seconds": 7.905313014984131,
+      "graph_nodes": 9,
+      "graph_edges": 8,
+      "gatv2_status": "analyzed",
+      "gatv2_prediction": "BENIGN",
+      "gatv2_anomaly_probability": 0.3065,
+      "gatv2_confidence": 0.6935,
+      "username": "UNKNOWN"
+    },
+    "csv_data_used_for_sample": false
+  },
+  "dashboard": {
+    "status": "VERIFIED",
+    "route": "backend.chat_service.dashboard_page",
+    "html_source": "inline DASHBOARD_HTML in backend/chat_service.py",
+    "bug": "Dashboard script assigned textContent on #messages, which was missing from the served markup.",
+    "fix": "Added a Recent messages card with id=messages.",
+    "javascript_console_errors": 0,
+    "failed_api_requests_on_current_url": 0,
+    "stale_address_failure": "The previous .81 URL stopped accepting requests after the Wi-Fi address changed to .100; the dashboard was reopened at the current .100 address.",
+    "analysis_counter_source": "GET /api/network/state; recent WebSocket events no longer overwrite the total.",
+    "websocket_events_live": true,
+    "live_data_visible": true
+  },
+  "chat_threat_engine": {
+    "status": "VERIFIED",
+    "normal_message": {
+      "delivered": true,
+      "message_risk": 0.0,
+      "url_risk": 0.0,
+      "behavior_risk": 0.0417,
+      "network_risk": 0.0,
+      "network_signal_available": false,
+      "final_risk": 0.0104,
+      "action": "ALLOW",
+      "network_association_reason": "no_captured_flow_matched_chat_tcp_5_tuple"
+    },
+    "suspicious_url_test": {
+      "status": "VERIFIED",
+      "url_visited": false,
+      "message_risk": 0.24,
+      "url_risk": 1.0,
+      "behavior_risk": 0.0417,
+      "network_signal_available": false,
+      "final_risk": 0.7,
+      "action": "BLOCK_MESSAGE",
+      "dashboard_event_visible": true
+    },
+    "structured_logging": "THREAT_DECISION logs record user, message ID, per-signal risk, network availability/flow association, final risk, and action; message content is omitted."
+  },
+  "flow_association": {
+    "method": "Exact captured TCP WebSocket 5-tuple: client IP/port plus server port.",
+    "status": "NOT VERIFIED FOR THESE CHAT CLIENTS",
+    "client_ips": {
+      "normal_sender": "192.168.1.81",
+      "normal_receiver": "192.168.1.81"
+    },
+    "reason": "The message test used two browser tabs on the same server computer. In the final run, a client stayed connected while live packet, flow, and GATv2 counts rose, but no captured flow matched port 8001. Unrelated traffic from the same host was not attributed to the chat user."
+  },
+  "behavior_block_test": {
+    "status": "VERIFIED",
+    "threshold_messages_per_30_seconds": 24,
+    "threshold_changed": false,
+    "rapid_test_messages_sent": 24,
+    "behavior_risk_observed": [0.7083, 0.75, 0.7917, 0.8333, 0.875, 0.9167, 0.9583, 1.0],
+    "intermediate_messages_rejected": true,
+    "block_action_at_behavior_risk": 1.0,
+    "websocket_closed": true,
+    "blocked_reconnect_rejected": true,
+    "dashboard_block_visible": true
+  },
+  "physical_device_test": {
+    "status": "NOT RUN",
+    "reason": "Only same-computer browser tabs were used; no other user-owned device was available for a controlled chat test."
+  },
+  "tests": {
+    "command": "rtk proxy python -B -m pytest -p no:cacheprovider -q",
+    "passed": 14,
+    "failed": 0,
+    "warnings": 37
+  },
+  "documentation": [
+    "models/diagnostics/final_system_validation.md",
+    "models/diagnostics/final_system_validation.json",
+    "NETWORK_DEMO.md"
+  ],
+  "limitations": [
+    "No physical-device chat flow was matched, analyzed, and returned to its sender.",
+    "The captured GATv2 sample was live LAN/multicast traffic, not the chat WebSocket flow.",
+    "The dashboard API and WebSocket were verified in the local browser session only."
+  ]
+}

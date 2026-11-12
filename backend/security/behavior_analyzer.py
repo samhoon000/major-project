@@ -1,73 +1,105 @@
-"""Sliding-window message behavior analysis; independent of network ML."""
-from __future__ import annotations
-
-import re
 import time
-from collections import Counter, defaultdict, deque
-from dataclasses import dataclass, field
-from typing import Callable
+from collections import defaultdict, deque
+from typing import Dict, Any, List
+from backend.config import BEHAVIOR_WINDOW_SECONDS, MAX_MESSAGES_PER_WINDOW, MAX_REPEATED_MESSAGES
 
+class UserBehaviorState:
+    def __init__(self, username: str):
+        self.username = username
+        self.message_timestamps: deque = deque()
+        self.recent_contents: deque = deque()
+        self.recent_recipients: deque = deque()
+        self.url_timestamps: deque = deque()
+        self.risk_score: float = 0.0
 
-@dataclass(frozen=True)
-class BehaviorConfig:
-    warning_messages_30s: int = 12
-    block_messages_30s: int = 24
-    window_seconds: float = 60.0
-
-
-@dataclass
-class UserBehavior:
-    messages: deque = field(default_factory=deque)
-    total_messages: int = 0
-
+    def purge_old_events(self, now: float, window: float):
+        cutoff = now - window
+        while self.message_timestamps and self.message_timestamps[0] < cutoff:
+            self.message_timestamps.popleft()
+        while self.recent_contents and self.recent_contents[0][0] < cutoff:
+            self.recent_contents.popleft()
+        while self.recent_recipients and self.recent_recipients[0][0] < cutoff:
+            self.recent_recipients.popleft()
+        while self.url_timestamps and self.url_timestamps[0] < cutoff:
+            self.url_timestamps.popleft()
 
 class BehaviorAnalyzer:
-    def __init__(self, config: BehaviorConfig | None = None, clock: Callable[[], float] = time.monotonic):
-        self.config = config or BehaviorConfig()
-        self.clock = clock
-        self.users: dict[str, UserBehavior] = defaultdict(UserBehavior)
+    def __init__(self):
+        self.user_states: Dict[str, UserBehaviorState] = defaultdict(UserBehaviorState)
 
-    def record(self, username: str, recipient: str, text: str) -> dict:
-        now = self.clock()
-        user = self.users[username]
-        while user.messages and now - user.messages[0][0] > self.config.window_seconds:
-            user.messages.popleft()
-        normalized = text.strip().casefold()
-        urls = re.findall(r"https?://[^\s<>\"']+", text, re.IGNORECASE)
-        user.messages.append((now, recipient, normalized, tuple(urls)))
-        user.total_messages += 1
-        messages = list(user.messages)
-        last = lambda seconds: [item for item in messages if now - item[0] <= seconds]
-        one, five, thirty, sixty = (last(s) for s in (1, 5, 30, 60))
-        repeats = sum(item[2] == normalized for item in sixty)
-        counts = Counter(item[2] for item in sixty)
-        repeated = sum(n for n in counts.values() if n > 1)
-        recipient_counts = len({item[1] for item in sixty})
-        url_count = sum(len(item[3]) for item in sixty)
+    def record_and_analyze(
+        self, username: str, content: str, recipient: str, has_url: bool = False
+    ) -> Dict[str, Any]:
+        now = time.time()
+        state = self.user_states[username]
+        state.username = username
+
+        # Purge events outside window
+        state.purge_old_events(now, BEHAVIOR_WINDOW_SECONDS)
+
+        # Record event
+        state.message_timestamps.append(now)
+        state.recent_contents.append((now, content.strip().lower()))
+        state.recent_recipients.append((now, recipient))
+        if has_url:
+            state.url_timestamps.append(now)
+
+        # 1. Rate calculation
+        msg_count = len(state.message_timestamps)
+        duration = max(0.5, now - state.message_timestamps[0]) if msg_count > 1 else 1.0
+        msgs_per_second = round(msg_count / duration, 2)
+        msgs_per_minute = round(msgs_per_second * 60, 1)
+
+        # 2. Repeated message content
+        identical_count = sum(1 for _, c in state.recent_contents if c == content.strip().lower())
+
+        # 3. Unique recipients in window
+        unique_recipients = len(set(r for _, r in state.recent_recipients))
+
+        # 4. Score calculation
+        score = 0.0
+        indicators: List[str] = []
+
+        # High message frequency
+        if msg_count > MAX_MESSAGES_PER_WINDOW:
+            freq_penalty = min(0.50, 0.10 * (msg_count - MAX_MESSAGES_PER_WINDOW))
+            score += freq_penalty
+            indicators.append(f"Message flooding: {msg_count} messages in {int(BEHAVIOR_WINDOW_SECONDS)}s ({msgs_per_second} msg/s)")
+
+        # Repeated identical spam messages
+        if identical_count >= MAX_REPEATED_MESSAGES:
+            score += 0.35
+            indicators.append(f"Identical message repetition ({identical_count} identical messages)")
+
+        # Rapid-fire timing (< 0.25s interval)
+        if len(state.message_timestamps) >= 2:
+            last_interval = state.message_timestamps[-1] - state.message_timestamps[-2]
+            if last_interval < 0.25:
+                score += 0.20
+                indicators.append(f"Unusually rapid message interval ({round(last_interval*1000)}ms)")
+
+        # Mass messaging to multiple recipients
+        if unique_recipients >= 3 and msg_count >= 5:
+            score += 0.25
+            indicators.append(f"Mass messaging: broadcast to {unique_recipients} unique targets")
+
+        # URL repetition
+        if len(state.url_timestamps) >= 3:
+            score += 0.30
+            indicators.append(f"Repeated link spreading ({len(state.url_timestamps)} links in window)")
+
+        risk = min(1.0, round(score, 4))
+        state.risk_score = risk
+
         return {
-            "total_messages": user.total_messages,
-            "messages_last_second": len(one), "messages_last_5_seconds": len(five),
-            "messages_last_30_seconds": len(thirty), "messages_last_60_seconds": len(sixty),
-            "messages_per_second": round(len(one), 3),
-            "messages_per_minute": round(len(sixty) * 60 / max(min(60.0, self.config.window_seconds), 1.0), 3),
-            "unique_recipients_last_minute": recipient_counts,
-            "repeated_messages": repeats,
-            "repeated_message_ratio": round(repeated / len(sixty), 3) if sixty else 0.0,
-            "repeated_url_count": max(0, url_count - len({url for item in sixty for url in item[3]})),
-            "risk": "BLOCK" if len(thirty) >= self.config.block_messages_30s else "SUSPICIOUS" if len(thirty) >= self.config.warning_messages_30s else "SAFE",
+            "behavior_risk": risk,
+            "messages_in_window": msg_count,
+            "messages_per_second": msgs_per_second,
+            "messages_per_minute": msgs_per_minute,
+            "identical_count": identical_count,
+            "unique_recipients": unique_recipients,
+            "indicators": indicators
         }
 
-    def reset(self, username: str) -> None:
-        self.users.pop(username, None)
+behavior_analyzer = BehaviorAnalyzer()
 
-    def snapshot(self) -> dict[str, dict]:
-        now = self.clock()
-        result = {}
-        for name, user in self.users.items():
-            items = [item for item in user.messages if now - item[0] <= 60]
-            thirty = [item for item in items if now - item[0] <= 30]
-            result[name] = {"total_messages": user.total_messages, "messages_last_30_seconds": len(thirty),
-                            "messages_per_second": round(sum(now-item[0] <= 1 for item in items), 3),
-                            "messages_per_minute": len(items), "unique_recipients": len({item[1] for item in items}),
-                            "risk": "BLOCK" if len(thirty) >= self.config.block_messages_30s else "SUSPICIOUS" if len(thirty) >= self.config.warning_messages_30s else "SAFE"}
-        return result

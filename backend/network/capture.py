@@ -24,15 +24,14 @@ def parse_scapy_packet(packet) -> dict | None:
             return None
         return {"timestamp": float(packet.time), "source_ip": ip.src, "destination_ip": ip.dst,
                 "source_port": int(transport.sport), "destination_port": int(transport.dport),
-                "protocol": protocol, "packet_length": int(len(packet)), "tcp_flags": flags}
+                "protocol": protocol, "packet_length": int(len(ip)), "tcp_flags": flags}
     except (AttributeError, TypeError, ValueError, IndexError):
         return None
 
 
 class PacketCapture:
     def __init__(self, handler: Callable[[dict], None], interface: str | None = None, bpf_filter: str | None = None):
-        self.handler = handler
-        self.interface = interface or os.getenv("NETWORK_INTERFACE") or os.getenv("CAPTURE_INTERFACE") or None
+        self.handler, self.interface = handler, interface or os.getenv("NETWORK_INTERFACE") or None
         self.bpf_filter = bpf_filter if bpf_filter is not None else os.getenv("NETWORK_CAPTURE_FILTER", "ip and (tcp or udp)")
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -46,75 +45,15 @@ class PacketCapture:
         except ImportError as exc:
             raise RuntimeError("Scapy is not installed. Install requirements to enable packet capture.") from exc
 
-    @staticmethod
-    def interface_details(devices: list[str]) -> list[str]:
-        """Map Scapy NPF device names to the current Windows adapter labels."""
-        try:
-            from scapy.arch.windows import get_windows_if_list
-            adapters = get_windows_if_list()
-        except (ImportError, AttributeError, OSError):
-            adapters = []
-        by_guid = {str(item.get("guid", "")).strip("{}").casefold(): item for item in adapters}
-        details = []
-        for device in devices:
-            guid = device.rsplit("_", 1)[-1].strip("{}").casefold() if device.startswith("\\Device\\NPF_{") else ""
-            adapter = by_guid.get(guid)
-            if adapter:
-                ips = ", ".join(adapter.get("ips", [])) or "no IP assigned"
-                details.append(f"{device} | {adapter.get('name')} | {adapter.get('description')} | {ips}")
-            else:
-                details.append(f"{device} | adapter details unavailable")
-        return details
-
-    def _resolve_configured_interface(self, devices: list[str]) -> str | None:
-        """Allow friendly Windows adapter names while retaining an exact NPF selection."""
-        if not self.interface:
-            return None
-        if self.interface in devices:
-            return self.interface
-        try:
-            from scapy.arch.windows import get_windows_if_list
-            adapters = get_windows_if_list()
-        except (ImportError, AttributeError, OSError):
-            adapters = []
-        requested = self.interface.casefold()
-        for adapter in adapters:
-            labels = {str(adapter.get("name", "")).casefold(),
-                      str(adapter.get("description", "")).casefold(),
-                      str(adapter.get("guid", "")).casefold()}
-            if requested in labels and adapter.get("guid"):
-                candidate = "\\Device\\NPF_" + str(adapter["guid"])
-                if candidate in devices:
-                    return candidate
-                raise RuntimeError(
-                    f"Windows adapter '{adapter.get('name')}' exists, but its NPF device is not visible to Scapy. "
-                    "Run the server in an elevated terminal and verify the Npcap adapter binding. "
-                    f"Scapy currently lists: {', '.join(devices) or '<none>'}."
-                )
-        return None
-
     def start(self) -> None:
         try:
             from scapy.all import sniff
             devices = self.interfaces()
-            details = self.interface_details(devices)
-            log.info("[CAPTURE] Available capture interfaces:\n%s", "\n".join(f"  {i}. {item}" for i, item in enumerate(details, 1)) or "  <none>")
-            resolved = self._resolve_configured_interface(devices)
-            if self.interface and not resolved:
-                raise RuntimeError(
-                    f"Configured capture interface '{self.interface}' is not available to Scapy. "
-                    f"Available NPF interfaces: {', '.join(devices) or '<none>'}. "
-                    "No loopback fallback is selected."
-                )
-            if resolved:
-                self.interface = resolved
-                selected = next((item for item in details if item.startswith(resolved + " |")), resolved)
-                log.info("[CAPTURE] Selected interface: %s", selected)
+            if self.interface and self.interface not in devices:
+                raise RuntimeError(f"NETWORK_INTERFACE '{self.interface}' not found. Available interfaces: {', '.join(devices)}")
             if not self.interface:
-                raise RuntimeError(
-                    "No capture interface is configured. Set NETWORK_INTERFACE or CAPTURE_INTERFACE to an exact "
-                    "Scapy NPF device or Windows adapter name (for example, Wi-Fi). No loopback fallback is selected."
-                )
+                log.info("[CAPTURE] Available interfaces: %s. Set NETWORK_INTERFACE to choose one.", ", ".join(devices))
+                raise RuntimeError("NETWORK_INTERFACE is not configured; select an interface from the logged list.")
             if self._stop.is_set():
                 return
         except Exception as exc:
