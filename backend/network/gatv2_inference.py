@@ -1,11 +1,13 @@
 import json
 import logging
+import warnings
 from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
 import torch
 from torch_geometric.data import Data
+from sklearn.exceptions import InconsistentVersionWarning
 
 from backend.config import (
     GATV2_MODEL_PATH,
@@ -44,8 +46,10 @@ class GATv2InferenceEngine:
                 self.model_config = json.load(f)
                 self.best_threshold = self.model_config.get("best_threshold", GATV2_ANOMALY_THRESHOLD)
 
-            self.node_scaler = joblib.load(NODE_SCALER_PATH)
-            self.edge_scaler = joblib.load(EDGE_SCALER_PATH)
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
+                self.node_scaler = joblib.load(NODE_SCALER_PATH)
+                self.edge_scaler = joblib.load(EDGE_SCALER_PATH)
 
             self.model = GNNAnomalyDetector(
                 node_dim=self.feature_config.get("node_dim", 5),

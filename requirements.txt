@@ -1,14 +1,34 @@
-pandas
-scikit-learn
-joblib
-matplotlib
-seaborn
-fastapi
-uvicorn
-python-multipart
-torch
-#torchvision
-#torchaudio
-torch-geometric
-networkx
-scapy
+# =====================================================================
+# Sentinel AI Network Intrusion Detection & Secure Chat
+# Pinned Dependencies (Verified on Python 3.13 on Windows)
+# =====================================================================
+
+# Web Framework & Server
+fastapi==0.162.4
+uvicorn==0.52.4
+starlette==1.6.0
+pydantic==2.14.3
+python-multipart==0.0.32
+python-dotenv==1.2.3
+
+# Machine Learning & Graph Neural Networks
+torch==2.11.0
+torch-geometric==2.7.0
+networkx==3.6.1
+scikit-learn==1.8.0
+joblib==1.5.3
+numpy==2.2.5
+pandas==3.0.2
+
+# Network Packet Capture
+scapy==2.8.0
+
+# Visualization & Image Utilities
+matplotlib==3.10.1
+seaborn==0.13.2
+pillow==11.2.1
+
+# Real-time WebSockets & HTTP Clients
+websockets==16.1.1
+httpx==0.28.1
+requests==2.33.1

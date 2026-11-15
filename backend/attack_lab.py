@@ -7,7 +7,7 @@ import threading
 import time
 from collections import deque
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Header
 from fastapi.responses import HTMLResponse, Response
 
 from backend.network.runtime import network_runtime
@@ -307,10 +307,19 @@ def attack_lab_status() -> dict:
 
 
 @router.post("/api/attack-lab/burst", status_code=204)
-def attack_lab_burst(request: Request) -> Response:
-    source_ip = request.client.host if request.client else ""
-    if not _is_private_lan_ipv4(source_ip):
-        raise HTTPException(status_code=403, detail="Traffic Burst is available only to private-LAN IPv4 clients.")
+def attack_lab_burst(request: Request, x_admin_token: str | None = Header(default=None)) -> Response:
+    peer_host = request.client.host if request.client else ""
+    from backend.chat_service import resolve_client_ip
+    source_ip = resolve_client_ip(peer_host, request.headers)
+
+    admin_token = os.getenv("ADMIN_TOKEN")
+    is_admin = bool(admin_token and x_admin_token == admin_token)
+
+    if not _is_private_lan_ipv4(source_ip) and not is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="Traffic Burst is available only to private-LAN IPv4 clients or authenticated administrator.",
+        )
 
     now = time.monotonic()
     with _burst_lock:
