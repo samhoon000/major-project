@@ -10,6 +10,7 @@ from collections import deque
 
 from backend.chat_service import state as chat_state
 from backend.network.capture import PacketCapture
+from backend.network.enforcement import QuarantineManager, Quarantine
 from backend.network.flow_tracker import FlowTracker
 from backend.network.gatv2_inference import gatv2_engine
 
@@ -34,6 +35,7 @@ class NetworkRuntime:
         self.completed_flows = deque(maxlen=300)
         self.started_at = time.monotonic()
         self.inference_window = float(os.getenv("GATV2_INFERENCE_WINDOW_SECONDS", "5"))
+        self.quarantine_manager = QuarantineManager()
         self.tracker = FlowTracker(
             idle_timeout=float(os.getenv("FLOW_IDLE_TIMEOUT", "15")),
             max_duration=float(os.getenv("FLOW_MAX_DURATION", "120")),
@@ -95,6 +97,15 @@ class NetworkRuntime:
             while True:
                 await asyncio.sleep(1)
                 self.tracker.expire()
+                if self.quarantine_manager:
+                    expired = self.quarantine_manager.expire()
+                    for exp in expired:
+                        log.info("[QUARANTINE] Expired firewall rule for %s (%s)", exp.source_ip, exp.rule_name)
+                        self._schedule_event("quarantine_expired", {
+                            "source_ip": exp.source_ip,
+                            "rule_name": exp.rule_name,
+                            "status": "EXPIRED",
+                        })
                 now = time.monotonic()
                 if now - last_batch >= self.inference_window:
                     batch = self._take_pending()
@@ -158,6 +169,30 @@ class NetworkRuntime:
                      "gatv2_prediction": prediction, "confidence": confidence,
                      "anomaly_probability": result["anomaly_probability"], "threshold": result["threshold"],
                      "detection_source": "GATV2", "action": "ALERT" if anomaly else "OBSERVED"}
+
+            quarantine_status = None
+            quarantine_reason = None
+            quarantine_rule = None
+            if prediction == "ATTACK" and self.quarantine_manager:
+                try:
+                    q_block, q_reason = self.quarantine_manager.handle_attack(event)
+                    quarantine_reason = q_reason
+                    if q_block:
+                        quarantine_status = "BLOCKED"
+                        quarantine_rule = q_block.rule_name
+                    else:
+                        quarantine_status = q_reason
+                except Exception as exc:
+                    log.exception("[QUARANTINE] Error handling attack for flow %s", flow.get("flow_id"))
+                    quarantine_status = f"ERROR: {exc}"
+                    quarantine_reason = str(exc)
+
+            event["quarantine_status"] = quarantine_status
+            event["quarantine_reason"] = quarantine_reason
+            event["quarantine_rule"] = quarantine_rule
+            if quarantine_status == "BLOCKED":
+                event["action"] = "QUARANTINED"
+
             await chat_state.event("gatv2_analysis", event)
 
     async def stop(self) -> None:
@@ -169,6 +204,10 @@ class NetworkRuntime:
             self._worker.cancel()
             await asyncio.gather(self._worker, return_exceptions=True)
             self._worker = None
+        if self.quarantine_manager:
+            closed = self.quarantine_manager.close()
+            if closed:
+                log.info("[QUARANTINE] Cleaned up %d firewall rules on shutdown", len(closed))
         self.tracker.expire(force=True)
         pending = self._take_pending()
         if pending:
@@ -185,19 +224,55 @@ class NetworkRuntime:
             capture_state = "starting"
         elif self.capture and self.capture._thread and self.capture._thread.is_alive() and not self.capture.error:
             capture_state = "running"
+        elif self.capture and self.capture.error:
+            capture_state = "unavailable"
+        elif self.capture and getattr(self.capture, "status", None):
+            capture_state = self.capture.status
+
         with self._pending_lock:
             pending = len(self._pending)
-        return {"capture": capture_state, "capture_error": self.capture.error if self.capture else "not started",
-                "interface": self.capture.interface if self.capture else None,
-                "capture_filter": self.capture.bpf_filter if self.capture else None,
-                "packets": self.packet_count, "bytes": self.byte_count, "packets_per_second": pps,
-                "bytes_per_second": bps, "active_flows": self.tracker.active_snapshots(),
-                "completed_flows": list(self.completed_flows), "gatv2": "available" if gatv2_engine._is_loaded else "unavailable",
-                "gatv2_error": None if gatv2_engine._is_loaded else "Model/scalers did not load; see server log.",
-                "gatv2_analyses": self.analysis_count, "gatv2_anomalies": self.anomaly_count,
-                "gatv2_threshold": gatv2_engine.best_threshold if gatv2_engine._is_loaded else None,
-                "latest_prediction": self.last_prediction, "pending_flows": pending,
-                "inference_window_seconds": self.inference_window}
+        return {
+            "capture": capture_state,
+            "capture_error": self.capture.error if self.capture else "not started",
+            "interface": self.capture.interface if self.capture else None,
+            "selected_adapter_name": getattr(self.capture, "adapter_name", None) if self.capture else None,
+            "adapter_name": getattr(self.capture, "adapter_name", None) if self.capture else None,
+            "adapter_description": getattr(self.capture, "adapter_description", None) if self.capture else None,
+            "adapter_type": getattr(self.capture, "adapter_type", None) if self.capture else None,
+            "local_ip": getattr(self.capture, "local_ip", None) if self.capture else None,
+            "npcap_interface": self.capture.interface if self.capture else None,
+            "selection_mode": getattr(self.capture, "selection_mode", None) if self.capture else None,
+            "selection_reason": getattr(self.capture, "selection_reason", None) if self.capture else None,
+            "is_automatic": getattr(self.capture, "is_automatic", False) if self.capture else False,
+            "capture_filter": self.capture.bpf_filter if self.capture else None,
+            "packets": self.packet_count,
+            "bytes": self.byte_count,
+            "packets_per_second": pps,
+            "bytes_per_second": bps,
+            "active_flows": self.tracker.active_snapshots(),
+            "completed_flows": list(self.completed_flows),
+            "gatv2": "available" if gatv2_engine._is_loaded else "unavailable",
+            "gatv2_error": None if gatv2_engine._is_loaded else "Model/scalers did not load; see server log.",
+            "gatv2_analyses": self.analysis_count,
+            "gatv2_anomalies": self.anomaly_count,
+            "gatv2_threshold": gatv2_engine.best_threshold if gatv2_engine._is_loaded else None,
+            "latest_prediction": self.last_prediction,
+            "pending_flows": pending,
+            "inference_window_seconds": self.inference_window,
+            "auto_quarantine": getattr(self.quarantine_manager, "auto_quarantine", False),
+            "quarantined_ips": [b.source_ip for b in self.quarantine_manager.blocks.values() if b.status == "BLOCKED"] if self.quarantine_manager else [],
+            "quarantine_count": len([b for b in self.quarantine_manager.blocks.values() if b.status == "BLOCKED"]) if self.quarantine_manager else 0,
+        }
+
+    def unblock_ip(self, ip: str) -> Quarantine | None:
+        if self.quarantine_manager:
+            return self.quarantine_manager.unblock(ip, status="ADMIN_UNBLOCKED")
+        return None
+
+    def get_quarantines(self) -> list[dict]:
+        if self.quarantine_manager:
+            return self.quarantine_manager.snapshot()
+        return []
 
 
 network_runtime = NetworkRuntime()

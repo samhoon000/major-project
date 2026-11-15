@@ -5,13 +5,14 @@ import threading
 import webbrowser
 import pandas as pd
 import numpy as np
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 from backend.chat_service import router as chat_router
 from backend.attack_lab import router as attack_lab_router
 from backend.network.runtime import network_runtime
+from backend.network.tunnel import tunnel_manager
 
 app = FastAPI(title="Network Anomaly Detection API")
 app.include_router(chat_router)
@@ -316,6 +317,10 @@ def home():
 
       <form class="panel" id="upload-form">
         <div>
+          <label for="admin-token">Admin Token</label>
+          <input id="admin-token" type="password" placeholder="Enter ADMIN_TOKEN" style="width:100%;padding:10px;border:1px solid #aab4c3;border-radius:8px;margin-bottom:12px;">
+        </div>
+        <div>
           <label for="dataset">CSV dataset</label>
           <input id="dataset" name="file" type="file" accept=".csv" required>
         </div>
@@ -369,9 +374,19 @@ def home():
       const data = new FormData();
       data.append("file", file);
 
-      const response = await fetch("/api/upload", { method: "POST", body: data });
-      const json = await response.json();
-      statusEl.textContent = json.error || json.message || "Upload complete.";
+      const adminToken = (document.getElementById("admin-token").value || "").trim();
+      const headers = adminToken ? { "X-Admin-Token": adminToken } : {};
+      try {
+        const response = await fetch("/api/upload", { method: "POST", body: data, headers });
+        const json = await response.json();
+        if (!response.ok) {
+          statusEl.textContent = json.detail || "Upload rejected: Admin Token required.";
+          return;
+        }
+        statusEl.textContent = json.error || json.message || "Upload complete.";
+      } catch (e) {
+        statusEl.textContent = "Upload failed: " + e.message;
+      }
     });
 
     predictBtn.addEventListener("click", async () => {
@@ -379,8 +394,15 @@ def home():
       statusEl.textContent = "Running model prediction...";
 
       try {
-        const response = await fetch("/api/predict", { method: "POST" });
+        const adminToken = (document.getElementById("admin-token").value || "").trim();
+        const headers = adminToken ? { "X-Admin-Token": adminToken } : {};
+        const response = await fetch("/api/predict", { method: "POST", headers });
         const json = await response.json();
+
+        if (!response.ok) {
+          statusEl.textContent = json.detail || "Prediction rejected: Admin Token required.";
+          return;
+        }
 
         if (json.error) {
           statusEl.textContent = json.error;
@@ -425,16 +447,89 @@ def home():
 async def startup_event():
     load_dataset()
     await network_runtime.start()
+    tunnel_manager.start()
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    tunnel_manager.stop()
     await network_runtime.stop()
 
 
 @app.get("/api/network/state")
 def network_state():
     return network_runtime.status()
+
+
+@app.get("/api/network/quarantine")
+def list_network_quarantines(
+    x_admin_token: str | None = Header(default=None),
+):
+    admin_token = os.getenv("ADMIN_TOKEN")
+    if not admin_token or x_admin_token != admin_token:
+        raise HTTPException(
+            status_code=403,
+            detail="Admin token is missing or invalid; configure ADMIN_TOKEN.",
+        )
+    return {
+        "auto_quarantine": getattr(network_runtime.quarantine_manager, "auto_quarantine", False),
+        "quarantines": network_runtime.get_quarantines(),
+    }
+
+
+@app.post("/api/network/quarantine/unblock/{ip}")
+async def unblock_network_quarantine(
+    ip: str,
+    x_admin_token: str | None = Header(default=None),
+):
+    import ipaddress
+    admin_token = os.getenv("ADMIN_TOKEN")
+    if not admin_token or x_admin_token != admin_token:
+        raise HTTPException(
+            status_code=403,
+            detail="Admin token is missing or invalid; configure ADMIN_TOKEN.",
+        )
+    try:
+        validated_ip = str(ipaddress.ip_address(ip.strip()))
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid IP address format: {ip}",
+        )
+    unblocked = network_runtime.unblock_ip(validated_ip)
+    if not unblocked:
+        raise HTTPException(
+            status_code=404,
+            detail=f"IP {validated_ip} is not currently quarantined.",
+        )
+    from backend.chat_service import state as chat_state
+    await chat_state.event("network_unblocked", {
+        "source_ip": validated_ip,
+        "rule_name": unblocked.rule_name,
+        "detection_source": "ADMIN_NETWORK",
+    })
+    return {
+        "status": "unblocked",
+        "ip": validated_ip,
+        "rule_name": unblocked.rule_name,
+    }
+
+
+@app.get("/api/tunnel/state")
+def tunnel_state_endpoint():
+    return tunnel_manager.status_dict()
+
+
+@app.get("/api/tunnel/qr.svg")
+def tunnel_qr_endpoint():
+    from backend.network.qr_generator import generate_qr_svg
+    from fastapi.responses import Response
+    svg = generate_qr_svg(tunnel_manager.active_joining_url)
+    return Response(
+        content=svg,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
 
 @app.get("/api/dataset")
 def get_dataset(page: int = 1, page_size: int = 15):
@@ -478,7 +573,16 @@ def get_graph():
     return {"error": "Graph image not found"}
 
 @app.post("/api/upload")
-async def upload_dataset(file: UploadFile = File(...)):
+async def upload_dataset(
+    file: UploadFile = File(...),
+    x_admin_token: str | None = Header(default=None),
+):
+    admin_token = os.getenv("ADMIN_TOKEN")
+    if not admin_token or x_admin_token != admin_token:
+        raise HTTPException(
+            status_code=403,
+            detail="Admin token is missing or invalid; configure ADMIN_TOKEN.",
+        )
     # Save the uploaded file
     os.makedirs("data", exist_ok=True)
     with open(UPLOAD_PATH, "wb") as f:
@@ -488,7 +592,15 @@ async def upload_dataset(file: UploadFile = File(...)):
     return {"message": "File uploaded successfully", "filename": file.filename}
 
 @app.post("/api/predict")
-def run_prediction():
+def run_prediction(
+    x_admin_token: str | None = Header(default=None),
+):
+    admin_token = os.getenv("ADMIN_TOKEN")
+    if not admin_token or x_admin_token != admin_token:
+        raise HTTPException(
+            status_code=403,
+            detail="Admin token is missing or invalid; configure ADMIN_TOKEN.",
+        )
     if not os.path.exists(UPLOAD_PATH):
         return {"error": "No dataset uploaded yet. Please upload a CSV first."}
         
