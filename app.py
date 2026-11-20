@@ -13,19 +13,30 @@ from backend.chat_service import router as chat_router
 from backend.attack_lab import router as attack_lab_router
 from backend.network.runtime import network_runtime
 from backend.network.tunnel import tunnel_manager
+from backend.security.http_flood import HTTPFloodGuard, http_flood_simulator
+from backend.security.demo_access import DemoExposure, DemoCORSMiddleware, router as auth_router, public_origin
+from backend.config import HOST, PORT
 
 app = FastAPI(title="Network Anomaly Detection API")
 app.include_router(chat_router)
 app.include_router(attack_lab_router)
+app.include_router(auth_router)
 
 # Enable CORS for frontend
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # Adjust in production
+    DemoCORSMiddleware,
+    allow_origins=[public_origin()] if public_origin() else [],
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?",
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "X-Admin-Token", "X-CSRF-Token"],
 )
+app.add_middleware(HTTPFloodGuard)
+app.add_middleware(DemoExposure)
+
+@app.on_event("shutdown")
+async def stop_http_flood_simulation():
+    await http_flood_simulator.close()
 
 DATASET_PATH = "data/full_dataset.csv"
 GRAPH_IMG_PATH = "data/network_graph.png"
@@ -628,5 +639,5 @@ def run_prediction(
 
 if __name__ == "__main__":
     import uvicorn
-    threading.Timer(1.2, lambda: webbrowser.open("http://127.0.0.1:8000")).start()
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    threading.Timer(1.2, lambda: webbrowser.open(f"http://127.0.0.1:{PORT}")).start()
+    uvicorn.run(app, host=HOST, port=PORT, proxy_headers=False)

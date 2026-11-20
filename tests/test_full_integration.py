@@ -27,7 +27,7 @@ class TestFullApplicationIntegration(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.client = TestClient(app)
+        cls.client = TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 50000))
         cls.admin_token = os.getenv("ADMIN_TOKEN") or "sentinel_integration_secret_token"
         os.environ["ADMIN_TOKEN"] = cls.admin_token
 
@@ -130,7 +130,7 @@ class TestFullApplicationIntegration(unittest.TestCase):
 
     def test_dashboard_receives_realtime_security_events(self):
         """Validates that SOC dashboard receives real-time security events over its WebSocket."""
-        with self.client.websocket_connect("/ws/dashboard", headers={"origin": "http://localhost:8001"}) as ws_dash:
+        with self.client.websocket_connect("/ws/dashboard", headers={"origin": "http://localhost:8001", "host":"localhost:8001"}) as ws_dash:
             snapshot = ws_dash.receive_json()
             self.assertEqual(snapshot["type"], "snapshot")
 

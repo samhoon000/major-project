@@ -50,7 +50,7 @@ class TestCloudflareTunnelManager(unittest.TestCase):
     """Verifies TunnelManager behavior, configuration, and security guarantees."""
 
     def test_init_without_token_is_disabled(self):
-        mgr = TunnelManager(token="", public_hostname="demo.example.com", local_port=8001)
+        mgr = TunnelManager(token="", public_hostname="demo.example.com", local_port=8001, mode="named")
         self.assertEqual(mgr.status, "disabled")
         self.assertFalse(mgr.is_public_ready)
         self.assertFalse(mgr.edge_connected)
@@ -313,7 +313,7 @@ class TestWebSocketOriginValidation(unittest.TestCase):
 
     def test_websocket_connect_with_cloudflare_quick_tunnel_origin(self):
         """Verifies end-to-end WebSocket handshake over Cloudflare Quick Tunnel origin."""
-        client = TestClient(app)
+        client = TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 50000))
         with client.websocket_connect(
             "/ws/chat/cftunneluser",
             headers={
@@ -327,7 +327,7 @@ class TestWebSocketOriginValidation(unittest.TestCase):
 
     def test_websocket_connect_with_lan_origin(self):
         """Verifies end-to-end WebSocket handshake over local LAN origin (ws://)."""
-        client = TestClient(app)
+        client = TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 50000))
         with client.websocket_connect(
             "/ws/chat/lanuser1",
             headers={
@@ -342,7 +342,7 @@ class TestWebSocketOriginValidation(unittest.TestCase):
     def test_websocket_connect_with_untrusted_origin_rejected(self):
         """Verifies that untrusted third-party Origin is closed with Policy Violation (1008)."""
         from starlette.websockets import WebSocketDisconnect
-        client = TestClient(app)
+        client = TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 50000))
         with self.assertRaises(WebSocketDisconnect) as ctx:
             with client.websocket_connect(
                 "/ws/chat/eviloriginuser",
@@ -356,7 +356,7 @@ class TestWebSocketOriginValidation(unittest.TestCase):
 
     def test_frontend_templates_use_wss_for_https_and_ws_for_http(self):
         """Verifies frontend HTML templates construct WSS for HTTPS and WS for LAN HTTP."""
-        client = TestClient(app)
+        client = TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 50000))
         chat_res = client.get("/chat")
         self.assertEqual(chat_res.status_code, 200)
         self.assertIn("location.protocol === 'https:' ? 'wss:' : 'ws:'", chat_res.text)
@@ -373,7 +373,7 @@ class TestAdministrativeEndpointProtection(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.client = TestClient(app)
+        cls.client = TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 50000))
 
     def test_upload_dataset_rejects_missing_admin_token(self):
         res = self.client.post("/api/upload", files={"file": ("test.csv", b"col1,col2\n1,2")})
@@ -420,7 +420,7 @@ class TestTunnelEndpoints(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.client = TestClient(app)
+        cls.client = TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 50000))
 
     def test_api_tunnel_state(self):
         res = self.client.get("/api/tunnel/state")

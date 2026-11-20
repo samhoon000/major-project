@@ -20,6 +20,7 @@ from backend.security.message_analyzer import message_analyzer
 from backend.security.url_analyzer import url_analyzer
 from backend.security.threat_engine import threat_engine
 import ipaddress
+from backend.security.demo_access import demo_security
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -258,8 +259,12 @@ class ChatState:
 
     async def broadcast_dashboard(self, item: dict[str, Any]) -> None:
         dead = []
-        for ws in dashboard_clients:
+        for ws in list(dashboard_clients):
             try:
+                if not demo_security.can_view(ws):
+                    await ws.close(code=1008)
+                    dead.append(ws)
+                    continue
                 await ws.send_json(item)
             except Exception:
                 dead.append(ws)
@@ -344,7 +349,7 @@ DASHBOARD_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <section class="panel" style="margin-top:12px"><div class="panel-head"><div><h2 class="panel-title">ACCESS &amp; CONNECTIVITY // CLOUDFLARE TUNNEL &amp; LOCAL LAN</h2><div class="panel-kicker">MULTI-DEVICE JOINING URLS &amp; REAL-TIME QR CODE</div></div><span class="tag" id="tunnelStatusTag">TUNNEL —</span></div><div style="display:flex;gap:20px;align-items:center;flex-wrap:wrap;padding:6px 0"><div style="background:#fff;padding:8px;border-radius:8px;display:inline-block;line-height:0" id="dashboardQrWrap"><img id="dashboardQrImg" src="/api/tunnel/qr.svg" width="120" height="120" alt="Join QR Code" style="display:block"></div><div style="flex:1;min-width:240px;display:grid;gap:8px"><div class="readout-item"><div class="label">ACTIVE JOINING URL (<span id="joiningModeLabel">LOCAL LAN</span>)</div><div class="value" style="font-size:13px;font-weight:600;color:var(--green)" id="activeJoiningUrl">—</div></div><div style="display:flex;gap:16px;flex-wrap:wrap"><div class="readout-item"><div class="label">PUBLIC CLOUDFLARE URL</div><div class="value" id="publicTunnelUrl">—</div></div><div class="readout-item"><div class="label">LOCAL WI-FI (LAN) URL</div><div class="value" id="localLanUrl">—</div></div></div><div class="small" id="tunnelDetailNote" style="color:var(--muted)">Checking tunnel status...</div></div></div></section>
 <footer class="footer"><span id="interfaceInfo">CAPTURE INTERFACE: UNKNOWN</span><span>ATTACK CLASSIFICATION IS PROVIDED BY THE EXISTING GATv2 PIPELINE.</span><span id="updatedAt">UPDATED: —</span></footer></main>
 <script>
-const $=id=>document.getElementById(id);const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));let events=[],networkState=null,chatState=null,samples=[],socket=null;const sampleLimit=31;function eventKey(x){return [x.timestamp,x.type,x.flow_id,x.message_id,x.username,x.source_ip].join('|')}function mergeEvents(incoming){const map=new Map(events.map(x=>[eventKey(x),x]));(incoming||[]).forEach(x=>{if(x&&x.type)map.set(eventKey(x),x)});events=Array.from(map.values()).sort((a,b)=>(a.timestamp||0)-(b.timestamp||0)).slice(-500)}function attackEvents(){return events.filter(x=>x.type==='gatv2_analysis'&&(x.gatv2_prediction==='ATTACK'||x.prediction==='ATTACK'))}function timeText(ts){return ts?new Date(ts*1000).toLocaleTimeString(): '—'}function formatRate(value){return Number(value||0).toLocaleString(undefined,{maximumFractionDigits:1})}function formatBytes(value){const n=Number(value||0);if(n<1024)return n.toFixed(0)+' B/s';if(n<1048576)return (n/1024).toFixed(1)+' KB/s';return (n/1048576).toFixed(2)+' MB/s'}function privateIp(ip){if(!ip)return false;if(ip==='::1'||ip.indexOf('fc')===0||ip.indexOf('fd')===0)return true;const m=ip.match(/^(\d{1,3})\.(\d{1,3})\./);if(!m)return false;const a=Number(m[1]),b=Number(m[2]);return a===10||a===127||(a===192&&b===168)||(a===172&&b>=16&&b<=31)}function getFlow(id){if(!networkState)return null;return (networkState.completed_flows||[]).find(f=>f.flow_id===id)||null}
+const $=id=>document.getElementById(id);const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));let events=[],networkState=null,chatState=null,samples=[],socket=null,dashboardRefreshBusy=false;const sampleLimit=31;function eventKey(x){return [x.timestamp,x.type,x.flow_id,x.message_id,x.username,x.source_ip].join('|')}function mergeEvents(incoming){const map=new Map(events.map(x=>[eventKey(x),x]));(incoming||[]).forEach(x=>{if(x&&x.type)map.set(eventKey(x),x)});events=Array.from(map.values()).sort((a,b)=>(a.timestamp||0)-(b.timestamp||0)).slice(-500)}function attackEvents(){return events.filter(x=>x.type==='gatv2_analysis'&&(x.gatv2_prediction==='ATTACK'||x.prediction==='ATTACK'))}function timeText(ts){return ts?new Date(ts*1000).toLocaleTimeString(): '—'}function formatRate(value){return Number(value||0).toLocaleString(undefined,{maximumFractionDigits:1})}function formatBytes(value){const n=Number(value||0);if(n<1024)return n.toFixed(0)+' B/s';if(n<1048576)return (n/1024).toFixed(1)+' KB/s';return (n/1048576).toFixed(2)+' MB/s'}function privateIp(ip){if(!ip)return false;if(ip==='::1'||ip.indexOf('fc')===0||ip.indexOf('fd')===0)return true;const m=ip.match(/^(\d{1,3})\.(\d{1,3})\./);if(!m)return false;const a=Number(m[1]),b=Number(m[2]);return a===10||a===127||(a===192&&b===168)||(a===172&&b>=16&&b<=31)}function getFlow(id){if(!networkState)return null;return (networkState.completed_flows||[]).find(f=>f.flow_id===id)||null}
 function drawGraph(){const svg=$('activityGraph');const w=900,h=260,left=48,right=15,top=12,bottom=24,pw=w-left-right,ph=h-top-bottom,now=Date.now()/1000,cut=now-60;const points=samples.filter(p=>p.t>=cut);const max=Math.max(1,...points.map(p=>p.v));const ceil=Math.max(5,Math.ceil(max/5)*5);let out='';for(let i=0;i<=4;i++){const val=ceil*(4-i)/4,y=top+ph*i/4;out+='<line x1="'+left+'" y1="'+y+'" x2="'+(w-right)+'" y2="'+y+'" stroke="#1d2c22" stroke-width="1"/><text x="'+(left-8)+'" y="'+(y+3)+'" fill="#728d77" font-size="9" text-anchor="end">'+Math.round(val)+'</text>'}for(let i=0;i<=6;i++){const x=left+pw*i/6;out+='<line x1="'+x+'" y1="'+top+'" x2="'+x+'" y2="'+(top+ph)+'" stroke="#142019" stroke-width="1"/><text x="'+x+'" y="'+(h-5)+'" fill="#728d77" font-size="8" text-anchor="middle">'+(i===6?'NOW':Math.round((i-6)*10)+'s')+'</text>'}if(points.length){const coords=points.map(p=>({x:left+Math.max(0,Math.min(60,p.t-cut))/60*pw,y:top+ph-(Math.min(ceil,p.v)/ceil)*ph}));const line=coords.map(p=>p.x.toFixed(1)+','+p.y.toFixed(1)).join(' ');out+='<polyline points="'+line+'" fill="none" stroke="#54e6ff" stroke-width="2" vector-effect="non-scaling-stroke"/>';const first=coords[0],last=coords[coords.length-1];out+='<polygon points="'+first.x+','+(top+ph)+' '+line+' '+last.x+','+(top+ph)+'" fill="#54e6ff" opacity=".06"/>'}const attacks=attackEvents().filter(x=>x.timestamp>=cut&&x.timestamp<=now);attacks.forEach(a=>{const x=left+(a.timestamp-cut)/60*pw;out+='<line x1="'+x+'" y1="'+top+'" x2="'+x+'" y2="'+(top+ph)+'" stroke="#ff3b4e" stroke-width="1" stroke-dasharray="4 4" opacity=".9"><title>GATv2 ATTACK · '+esc(timeText(a.timestamp))+' · '+esc(a.source_ip||'source unavailable')+'</title></line><path d="M '+(x-5)+' '+(top+ph+1)+' L '+(x+5)+' '+(top+ph+1)+' L '+x+' '+(top+ph-7)+' Z" fill="#ff3b4e"><title>GATv2 ATTACK · '+esc(timeText(a.timestamp))+'</title></path>'});svg.innerHTML=out}
 function renderIncident(n){const attacks=attackEvents(),a=attacks.length?attacks[attacks.length-1]:null,flow=a?getFlow(a.flow_id):null,probRaw=a?(a.anomaly_probability!=null?a.anomaly_probability:(flow&&flow.gatv2_anomaly_probability!=null?flow.gatv2_anomaly_probability:null)):null,prob=probRaw==null?null:Number(probRaw),thresholdRaw=(a&&a.threshold!=null?a.threshold:(flow&&flow.gatv2_threshold!=null?flow.gatv2_threshold:n.gatv2_threshold)),threshold=thresholdRaw==null?null:Number(thresholdRaw);const detected=!!a;const latestIsAttack=n.latest_prediction==='ATTACK';$('latest').textContent=n.latest_prediction||'WAITING FOR ANALYSIS';$('latest').className='value'+(n.latest_prediction==='ATTACK'?' pill attack':'');$('probability').textContent=detected&&prob!=null?(prob*100).toFixed(2)+'%':'—';$('probability').className=latestIsAttack?'attack':'';$('probFill').style.width=detected&&prob!=null?(Math.max(0,Math.min(1,prob))*100)+'%':'0%';$('probFill').className='prob-fill'+(latestIsAttack?' attack':'');$('probMarker').style.display=threshold==null?'none':'block';$('probMarker').style.left=(Math.max(0,Math.min(1,threshold||0))*100)+'%';$('thresholdLabel').textContent=threshold==null?'THRESHOLD —':'THRESHOLD '+threshold.toFixed(2);$('modelTag').textContent=n.gatv2==='available'?'MODEL ONLINE':'MODEL OFFLINE';$('modelTag').className='tag '+(n.gatv2==='available'?'ok':'bad');$('threats').textContent=attacks.length+' EVENTS';$('incidentPanel').innerHTML=detected?'<div class="incident-label">GATv2 ATTACK DETECTED · '+esc(timeText(a.timestamp))+'</div><div class="incident-title">NETWORK ATTACK</div><div class="incident-grid"><div><span class="small">SOURCE DEVICE</span><span class="value">'+esc(a.source_ip||'UNKNOWN LAN DEVICE')+' : '+esc(a.source_port==null?'—':a.source_port)+'</span></div><div><span class="small">SOURCE LOCATION</span><span class="value">'+(privateIp(a.source_ip)?'LOCAL NETWORK / WI-FI':'APPROXIMATE LOCATION NOT PROVIDED')+'</span></div><div><span class="small">TARGET</span><span class="value">'+esc(a.destination_ip||'—')+' : '+esc(a.destination_port==null?'—':a.destination_port)+'</span></div><div><span class="small">PROTOCOL</span><span class="value">'+esc(a.protocol||'—')+'</span></div><div><span class="small">GATv2 PROBABILITY</span><span class="value">'+(prob==null?'NOT PROVIDED':(prob*100).toFixed(2)+'%')+'</span></div><div><span class="small">THRESHOLD</span><span class="value">'+threshold.toFixed(2)+'</span></div><div><span class="small">DEVICE NAME</span><span class="value">UNKNOWN LAN DEVICE</span></div><div><span class="small">ACTION REPORTED</span><span class="value">'+esc(a.action||'ALERT')+' · NO FIREWALL STATUS IN API</span></div></div>':'<div class="incident-empty">No GATv2 ATTACK event in the received security event history. Host identity and physical location are shown only when provided by live services.</div>'}
 function renderBanner(n){const b=$('warningBanner'),indicator=$('liveIndicator'),secure=n.gatv2==='available'&&n.latest_prediction!=='ATTACK';if(n.latest_prediction==='ATTACK'){b.className='banner attack';$('bannerIcon').textContent='⚠';$('bannerTitle').textContent='LATEST GATv2 RESULT // ATTACK';$('bannerCopy').textContent='A real GATv2 ATTACK prediction is the latest model result. Incident details are from the associated captured flow.';indicator.className='live warn';indicator.textContent='ATTACK RESULT'}else if(n.gatv2!=='available'||n.capture!=='running'){b.className='banner wait';$('bannerIcon').textContent='◌';$('bannerTitle').textContent='MONITORING DEGRADED / STATE INCOMPLETE';$('bannerCopy').textContent='Capture: '+(n.capture||'unknown')+' · GATv2: '+(n.gatv2||'unknown')+' · '+(n.gatv2_error||n.capture_error||'waiting for live state');indicator.className='live wait';indicator.textContent='CHECK STATUS'}else{b.className='banner';$('bannerIcon').textContent='●';$('bannerTitle').textContent='NO CURRENT GATv2 ATTACK RESULT';$('bannerCopy').textContent='Latest GATv2 prediction: '+(n.latest_prediction||'none')+'. Historical attack events remain in the timeline.';indicator.className='live';indicator.textContent='LIVE / SECURE'}$('bannerMeta').textContent='LAST UPDATE: '+new Date().toLocaleTimeString()}
@@ -355,8 +360,30 @@ function renderFlows(n){const flows=[...(n.active_flows||[]),...(n.completed_flo
 function renderUsers(c){const users=c.behavior||{};$('userRows').innerHTML=Object.entries(users).map(([u,b])=>'<tr><td>'+esc(u)+'</td><td>'+esc(c.client_ips&&c.client_ips[u]||'UNKNOWN')+'</td><td>'+((c.blocked||[]).includes(u)?'<span class="pill attack">BLOCKED</span>':((c.users||[]).includes(u)?'<span class="pill">ONLINE</span>':'OFFLINE'))+'</td><td>'+esc(b.total_messages||0)+'</td><td>'+esc(b.messages_per_second||0)+'</td><td>'+esc(b.risk||'SAFE')+'</td><td>'+esc(c.block_reasons&&c.block_reasons[u]||'—')+'</td><td>'+((c.blocked||[]).includes(u)?'<button type="button" data-unblock="'+esc(u)+'">UNBLOCK</button>':'—')+'</td></tr>').join('')||'<tr><td colspan="8" class="small">No chat users observed.</td></tr>';document.querySelectorAll('[data-unblock]').forEach(btn=>btn.addEventListener('click',()=>unblock(btn.getAttribute('data-unblock'))))}
 function addSample(n){const t=Date.now()/1000,v=Number(n.packets_per_second||0);if(!samples.length||t-samples[samples.length-1].t>=1.8)samples.push({t:t,v:v});samples=samples.filter(p=>p.t>=t-60).slice(-sampleLimit);drawGraph()}
 async function unblock(user){const r=await fetch('/api/admin/unblock/'+encodeURIComponent(user),{method:'POST',headers:{'X-Admin-Token':$('adminToken').value}});if(!r.ok){const body=await r.json().catch(()=>({}));alert(body.detail||'Unblock failed');return}await refresh()}
-async function refresh(){try{const rs=await Promise.all([fetch('/api/chat/state',{cache:'no-store'}),fetch('/api/network/state',{cache:'no-store'}),fetch('/api/tunnel/state',{cache:'no-store'}).catch(()=>({ok:false}))]);if(!rs[0].ok||!rs[1].ok)throw new Error('API returned '+rs[0].status+' / '+rs[1].status);const c=await rs[0].json(),n=await rs[1].json();let t=null;if(rs[2]&&rs[2].ok)try{t=await rs[2].json()}catch(_){}chatState=c;networkState=n;mergeEvents(c.events||[]);$('pps').textContent=formatRate(n.packets_per_second);$('bps').textContent=formatBytes(n.bytes_per_second);$('active').textContent=(n.active_flows||[]).length;$('analyses').textContent=n.gatv2_analyses==null?'—':n.gatv2_analyses;$('anomalies').textContent=n.gatv2_anomalies==null?'—':n.gatv2_anomalies;$('users').textContent=(c.users||[]).length;$('blocked').textContent=(c.blocked||[]).length;$('mps').textContent=formatRate(c.messages_per_second);$('newFlows').textContent=events.filter(x=>x.type==='flow_started'&&Date.now()/1000-(x.timestamp||0)<=60).length;$('captureStatus').textContent='Capture: '+(n.capture||'unknown')+' · GATv2: '+(n.gatv2||'unknown')+' · Pending inference flows: '+(n.pending_flows||0)+(n.capture_error?' · '+n.capture_error:'')+(n.gatv2_error?' · '+n.gatv2_error:'');if(t){$('tunnelStatusTag').textContent='TUNNEL '+(t.status||'DISABLED').toUpperCase();$('tunnelStatusTag').className='tag '+(t.status==='running'?'ok':t.status==='error'?'bad':'');$('activeJoiningUrl').textContent=t.active_joining_url||'—';$('joiningModeLabel').textContent=t.joining_mode==='public_https'?'PUBLIC HTTPS':'LOCAL WI-FI';$('publicTunnelUrl').textContent=t.public_url||(t.public_hostname?('CONFIGURED ('+t.public_hostname+' - WAITING)'):'DISABLED / NOT CONFIGURED');$('localLanUrl').textContent=t.local_url||'—';$('tunnelDetailNote').textContent=t.error?t.error:(t.status==='running'?'Named tunnel connected to Cloudflare Edge. Public access active.':'Local LAN access active. Phone and laptop attendees on same Wi-Fi can join.')}$('interfaceInfo').textContent='CAPTURE: '+(n.adapter_name?(n.adapter_name+' ['+(n.adapter_type||'NET')+'] '+(n.local_ip?'('+n.local_ip+') ':'')+'['+(n.selection_mode||'auto')+']'):(n.interface||'NOT SELECTED'))+(t&&t.joining_mode==='public_https'?' · PUBLIC: HTTPS (CLOUDFLARE)':' · LOCAL: LAN ONLY');$('updatedAt').textContent='UPDATED: '+new Date().toLocaleTimeString();renderBanner(n);renderIncident(n);renderTimeline();renderTerminal();renderTopology(n);renderFlows(n);renderUsers(c);addSample(n)}catch(e){$('captureStatus').textContent='API UNAVAILABLE: '+e.message;$('liveIndicator').className='live wait';$('liveIndicator').textContent='API ERROR';$('warningBanner').className='banner wait';$('bannerTitle').textContent='LIVE STATE UNAVAILABLE';$('bannerCopy').textContent='Network and security state could not be refreshed.'}}
-$('refreshButton').addEventListener('click',refresh);socket=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws/dashboard');socket.onmessage=e=>{try{const x=JSON.parse(e.data);if(x.type==='snapshot'){mergeEvents(x.events||[]);if(chatState)renderTerminal();return}if(x.type==='users'){if(chatState){chatState.users=x.users||[];chatState.blocked=x.blocked||[];renderUsers(chatState)}return}mergeEvents([x]);renderTerminal();renderTimeline();if(x.type==='gatv2_analysis'||x.type==='flow_started'||x.type==='flow_completed')refresh()}catch(_){}};socket.onclose=()=>{ $('liveIndicator').className='live wait';$('liveIndicator').textContent='EVENT STREAM OFFLINE'};refresh();setInterval(refresh,2000);
+async function refresh(){if(window.SentinelAuth&&!window.SentinelAuth.canView)return;if(dashboardRefreshBusy)return;dashboardRefreshBusy=true;try{const rs=await Promise.all([fetch('/api/chat/state',{cache:'no-store'}),fetch('/api/network/state',{cache:'no-store'}),fetch('/api/tunnel/state',{cache:'no-store'}).catch(()=>({ok:false}))]);if(!rs[0].ok||!rs[1].ok)throw new Error('API returned '+rs[0].status+' / '+rs[1].status);const c=await rs[0].json(),n=await rs[1].json();let t=null;if(rs[2]&&rs[2].ok)try{t=await rs[2].json()}catch(_){}chatState=c;networkState=n;mergeEvents(c.events||[]);$('pps').textContent=formatRate(n.packets_per_second);$('bps').textContent=formatBytes(n.bytes_per_second);$('active').textContent=(n.active_flows||[]).length;$('analyses').textContent=n.gatv2_analyses==null?'—':n.gatv2_analyses;$('anomalies').textContent=n.gatv2_anomalies==null?'—':n.gatv2_anomalies;$('users').textContent=(c.users||[]).length;$('blocked').textContent=(c.blocked||[]).length;$('mps').textContent=formatRate(c.messages_per_second);$('newFlows').textContent=events.filter(x=>x.type==='flow_started'&&Date.now()/1000-(x.timestamp||0)<=60).length;$('captureStatus').textContent='Capture: '+(n.capture||'unknown')+' · GATv2: '+(n.gatv2||'unknown')+' · Pending inference flows: '+(n.pending_flows||0)+(n.capture_error?' · '+n.capture_error:'')+(n.gatv2_error?' · '+n.gatv2_error:'');if(t){$('tunnelStatusTag').textContent='TUNNEL '+(t.status||'DISABLED').toUpperCase();$('tunnelStatusTag').className='tag '+(t.status==='running'?'ok':t.status==='error'?'bad':'');$('activeJoiningUrl').textContent=t.active_joining_url||'—';$('joiningModeLabel').textContent=t.joining_mode==='public_https'?'PUBLIC HTTPS':'LOCAL WI-FI';$('publicTunnelUrl').textContent=t.public_url||(t.public_hostname?('CONFIGURED ('+t.public_hostname+' - WAITING)'):'DISABLED / NOT CONFIGURED');$('localLanUrl').textContent=t.local_url||'—';$('tunnelDetailNote').textContent=t.error?t.error:(t.status==='running'?'Named tunnel connected to Cloudflare Edge. Public access active.':'Local LAN access active. Phone and laptop attendees on same Wi-Fi can join.')}$('interfaceInfo').textContent='CAPTURE: '+(n.adapter_name?(n.adapter_name+' ['+(n.adapter_type||'NET')+'] '+(n.local_ip?'('+n.local_ip+') ':'')+'['+(n.selection_mode||'auto')+']'):(n.interface||'NOT SELECTED'))+(t&&t.joining_mode==='public_https'?' · PUBLIC: HTTPS (CLOUDFLARE)':' · LOCAL: LAN ONLY');$('updatedAt').textContent='UPDATED: '+new Date().toLocaleTimeString();renderBanner(n);renderIncident(n);renderTimeline();renderTerminal();renderTopology(n);renderFlows(n);renderUsers(c);addSample(n)}catch(e){$('captureStatus').textContent='API UNAVAILABLE: '+e.message;$('liveIndicator').className='live wait';$('liveIndicator').textContent='API ERROR';$('warningBanner').className='banner wait';$('bannerTitle').textContent='LIVE STATE UNAVAILABLE';$('bannerCopy').textContent='Network and security state could not be refreshed.'}finally{dashboardRefreshBusy=false}}
+let dashboardRetries=0,dashboardTimer=null,dashboardDisposed=false;
+function connectDashboard(){
+ if(dashboardDisposed||(window.SentinelAuth&&!window.SentinelAuth.canView)||(socket&&socket.readyState<=1))return;
+ socket=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws/dashboard');
+ socket.onopen=()=>{dashboardRetries=0;refresh();};
+ socket.onmessage=e=>{try{const x=JSON.parse(e.data);if(x.type==='HTTP_FLOOD_TELEMETRY')return;if(x.type==='snapshot'){mergeEvents(x.events||[]);if(chatState)renderTerminal();return}if(x.type==='users'){if(chatState){chatState.users=x.users||[];chatState.blocked=x.blocked||[];renderUsers(chatState)}return}mergeEvents([x]);renderTerminal();renderTimeline();if(x.type==='gatv2_analysis'||x.type==='flow_started'||x.type==='flow_completed')refresh()}catch(_){}};
+ socket.onclose=()=>{
+  $('liveIndicator').className='live wait';$('liveIndicator').textContent='EVENT STREAM OFFLINE';
+  if(dashboardDisposed||(window.SentinelAuth&&!window.SentinelAuth.canView)||dashboardRetries>=6)return;
+  dashboardTimer=setTimeout(connectDashboard,Math.min(15000,1000*2**dashboardRetries++));
+ };
+ socket.onerror=()=>{$('liveIndicator').textContent='STREAM ERROR / RETRYING';};
+}
+$('refreshButton').addEventListener('click',()=>{dashboardRetries=0;connectDashboard();refresh();});
+window.addEventListener('sentinel-auth-changed',()=>{
+ clearTimeout(dashboardTimer);dashboardRetries=0;
+ if(window.SentinelAuth.canView){connectDashboard();refresh();}
+ else {if(socket)socket.close();events=[];networkState=null;chatState=null;}
+});
+if(window.SentinelAuth)window.SentinelAuth.ready.then(()=>{connectDashboard();refresh();});
+else {connectDashboard();refresh();}
+const dashboardPoll=setInterval(refresh,2000);
+window.addEventListener('pagehide',()=>{dashboardDisposed=true;clearInterval(dashboardPoll);clearTimeout(dashboardTimer);if(socket)socket.close();},{once:true});
 </script></body></html>"""
 
 CHAT_HTML = r"""<!doctype html>
@@ -1735,7 +1762,10 @@ async def chat_page() -> str:
 
 @router.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_page() -> str:
-    return DASHBOARD_HTML
+    from backend.http_flood_ui import http_flood_panel
+    from backend.security_ui import security_panel
+    return DASHBOARD_HTML.replace("</header>", "</header>" + security_panel() + http_flood_panel(), 1)
+
 
 
 @router.get("/api/chat/state")
@@ -1755,13 +1785,13 @@ async def chat_state() -> dict:
 
 
 @router.get("/api/tunnel/state")
-async def tunnel_state() -> dict:
+def tunnel_state() -> dict:
     from backend.network.tunnel import tunnel_manager
     return tunnel_manager.status_dict()
 
 
 @router.get("/api/tunnel/qr.svg")
-async def tunnel_qr_svg() -> Response:
+def tunnel_qr_svg() -> Response:
     from backend.network.tunnel import tunnel_manager
     from backend.network.qr_generator import generate_qr_svg
     svg = generate_qr_svg(tunnel_manager.active_joining_url)
@@ -1774,9 +1804,12 @@ async def tunnel_qr_svg() -> Response:
 
 @router.websocket("/ws/dashboard")
 async def dashboard_socket(ws: WebSocket) -> None:
+    if not demo_security.can_view(ws):
+        await ws.close(code=1008)
+        return
     origin = ws.headers.get("origin")
-    request_host = ws.headers.get("x-forwarded-host") or ws.headers.get("host")
-    if not is_origin_allowed(origin, request_host=request_host):
+    request_host = ws.headers.get("host")
+    if not await asyncio.to_thread(is_origin_allowed, origin, request_host=request_host):
         logger.warning("[SECURITY] Rejected WebSocket dashboard connection from untrusted origin: %s", origin)
         await ws.close(code=1008)
         return
@@ -1784,10 +1817,17 @@ async def dashboard_socket(ws: WebSocket) -> None:
     dashboard_clients.add(ws)
     await ws.send_json({"type": "snapshot", "users": sorted(state.clients), "blocked": sorted(state.blocked), "events": list(state.events), "block_reasons": state.block_reasons})
     try:
-        while True:
-            await ws.receive_text()
+        while demo_security.can_view(ws):
+            try:
+                await asyncio.wait_for(ws.receive_text(), timeout=10)
+            except asyncio.TimeoutError:
+                continue
+        await ws.close(code=1008)
     except WebSocketDisconnect:
+        pass
+    finally:
         dashboard_clients.discard(ws)
+
 
 
 @router.post("/api/admin/unblock/{user_id}")
@@ -1808,8 +1848,8 @@ async def unblock_user(user_id: str, x_admin_token: str | None = Header(default=
 @router.websocket("/ws/chat/{username}")
 async def chat_socket(ws: WebSocket, username: str) -> None:
     origin = ws.headers.get("origin")
-    request_host = ws.headers.get("x-forwarded-host") or ws.headers.get("host")
-    if not is_origin_allowed(origin, request_host=request_host):
+    request_host = ws.headers.get("host")
+    if not await asyncio.to_thread(is_origin_allowed, origin, request_host=request_host):
         logger.warning("[SECURITY] Rejected WebSocket chat connection for user '%s' from untrusted origin: %s", username, origin)
         await ws.close(code=1008)
         return

@@ -12,7 +12,7 @@ except ImportError:
 
 # Server
 HOST = os.getenv("HOST", "0.0.0.0")
-PORT = int(os.getenv("PORT", 8000))
+PORT = int(os.getenv("PORT", 8001))
 
 # Security
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
