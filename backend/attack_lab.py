@@ -7,7 +7,7 @@ import threading
 import time
 from collections import deque
 
-from fastapi import APIRouter, HTTPException, Request, Header
+from fastapi import APIRouter, HTTPException, Request, Header, Depends
 from fastapi.responses import HTMLResponse, Response
 
 from backend.network.runtime import network_runtime
@@ -106,7 +106,7 @@ ATTACK_LAB_HTML = r"""<!doctype html>
 <body>
 <main>
   <section class="card" aria-labelledby="title">
-    <header><h1 id="title">Network Attack Lab</h1><p class="intro">Local demonstration only. Tests originate in this phone's browser and target only this laptop.</p></header>
+    <header><h1 id="title">Network Attack Lab</h1><p class="intro">Authenticated demonstration. HTTP flood requests run only on the host loopback endpoint. Legacy browser tests are available locally.</p></header>
     <div class="state-grid" aria-live="polite">
       <div class="state"><span class="label">Target</span><span class="value" id="target">Resolving…</span></div>
       <div class="state"><span class="label">Capture</span><span class="value pill" id="capture">CHECKING</span></div>
@@ -121,6 +121,7 @@ ATTACK_LAB_HTML = r"""<!doctype html>
     <div id="progress" class="status" role="status" aria-live="polite">Checking the live capture service…</div>
     <p class="fine">Port Scan sends at most 101 browser requests to this laptop on ports 8000–8100, one every 250 ms, for no more than 30 seconds. The browser hides connection details; view real captured flows and GATv2 results in the dashboard.</p>
     <p class="fine">Traffic Burst sends at most 40 small requests to this app over 8 seconds. The server also limits this endpoint to 50 requests per source in any 15-second window. No test data is saved.</p>
+    <!-- HTTP_FLOOD_PANEL -->
     <nav class="links"><a href="/dashboard">Live dashboard</a><a href="/chat">Secure chat</a></nav>
   </section>
 </main>
@@ -142,6 +143,18 @@ ATTACK_LAB_HTML = r"""<!doctype html>
   let starting = false;
   let runtimeTimer = null;
 
+  async function authorizeLab() {
+    if (!window.SentinelAuth.local) {
+      document.getElementById("hf-error").textContent="Browser scan and burst tests are local-only. Use the server-side HTTP Flood controls remotely.";
+      return false;
+    }
+    const token = document.getElementById("hf-token").value.trim();
+    try {
+      const response = await window.SentinelAuth.fetch("/api/attack-lab/http-flood/authorize", {method:"POST", headers:token?{"X-Admin-Token":token}:{}});
+      if (!response.ok) throw new Error("Local administrator authorization required.");
+      return true;
+    } catch (error) { document.getElementById("hf-error").textContent = error.message; return false; }
+  }
   function setTestStatus(value) { $("testStatus").textContent = value; }
   function setButtons(enabled) {
     $("portScan").disabled = !enabled;
@@ -175,6 +188,7 @@ ATTACK_LAB_HTML = r"""<!doctype html>
   }
   async function startPortScan() {
     if (running || starting) return;
+    if (!(await authorizeLab())) return;
     starting = true;
     $("portScan").disabled = true;
     $("trafficBurst").disabled = true;
@@ -208,6 +222,7 @@ ATTACK_LAB_HTML = r"""<!doctype html>
   }
   async function startTrafficBurst() {
     if (running || starting) return;
+    if (!(await authorizeLab())) return;
     starting = true;
     $("portScan").disabled = true;
     $("trafficBurst").disabled = true;
@@ -232,7 +247,7 @@ ATTACK_LAB_HTML = r"""<!doctype html>
       }
       const controller = new AbortController();
       testControllers.add(controller);
-      fetch("/api/attack-lab/burst", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({sequence:sent + 1}), cache:"no-store", signal:controller.signal})
+      window.SentinelAuth.fetch("/api/attack-lab/burst", {method:"POST", headers:{"Content-Type":"application/json", "X-Admin-Token":document.getElementById("hf-token").value.trim()}, body:JSON.stringify({sequence:sent + 1}), cache:"no-store", signal:controller.signal})
         .then((response) => { if (response.status === 429) finishTest("The server reached its per-source burst limit."); })
         .catch(() => {})
         .finally(() => testControllers.delete(controller));
@@ -244,6 +259,12 @@ ATTACK_LAB_HTML = r"""<!doctype html>
     sendNext();
   }
   async function refreshRuntime() {
+    if (!window.SentinelAuth.canView) return;
+    if (!window.SentinelAuth.local) {
+      $("portScan").disabled=true; $("trafficBurst").disabled=true;
+      $("progress").textContent="Remote mode: use HTTP Flood below. Browser-originated scan/burst controls remain local-only.";
+      return;
+    }
     try {
       const response = await fetch("/api/attack-lab/status", {cache:"no-store"});
       const status = await response.json();
@@ -286,7 +307,88 @@ ATTACK_LAB_HTML = r"""<!doctype html>
 
 @router.get("/attack-lab", response_class=HTMLResponse)
 def attack_lab_page() -> str:
-    return ATTACK_LAB_HTML
+    from backend.http_flood_ui import http_flood_panel
+    from backend.security_ui import security_panel
+    return ATTACK_LAB_HTML.replace("</header>", "</header>" + security_panel(), 1).replace("<!-- HTTP_FLOOD_PANEL -->", http_flood_panel(controls=True))
+
+
+@router.get("/api/attack-lab/http-flood-target")
+async def http_flood_target() -> dict:
+    return {"status": "ok", "run_id": http_flood_simulator.run_id}
+
+
+async def require_lab_admin(request: Request, x_admin_token: str | None = Header(default=None)):
+    from backend.security.demo_access import demo_security
+    demo_security.require_control(request)
+
+
+async def require_local_lab_admin(request: Request):
+    from backend.security.demo_access import demo_security
+    demo_security.require_control(request, local_only=True)
+
+
+def lab_origin(request: Request):
+    # The listening port comes from ASGI server scope, never Host or a submitted URL.
+    server = request.scope.get("server")
+    if not server or not server[1]:
+        raise HTTPException(status_code=503, detail="Cannot determine the local listener port")
+    return os.getenv("HTTP_FLOOD_BASE_URL") or f"http://127.0.0.1:{server[1]}"
+
+
+from backend.security.http_flood import RunConfig, http_flood_simulator
+
+
+@router.post("/api/attack-lab/http-flood/authorize", dependencies=[Depends(require_local_lab_admin)])
+async def http_flood_authorize():
+    return {"authorized": True}
+
+
+@router.post("/api/attack-lab/http-flood/start", dependencies=[Depends(require_lab_admin)])
+async def http_flood_start(request: Request, config: RunConfig) -> dict:
+    try:
+        return await http_flood_simulator.start(lab_origin(request), config)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/api/attack-lab/http-flood/monitor", dependencies=[Depends(require_lab_admin)])
+async def http_flood_monitor(request: Request) -> dict:
+    try:
+        return await http_flood_simulator.prepare(lab_origin(request))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/api/attack-lab/http-flood/stop", dependencies=[Depends(require_lab_admin)])
+async def http_flood_stop() -> dict:
+    return await http_flood_simulator.stop()
+
+
+@router.post("/api/attack-lab/http-flood/reset", dependencies=[Depends(require_lab_admin)])
+async def http_flood_reset() -> dict:
+    try:
+        return await http_flood_simulator.reset()
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/api/attack-lab/http-flood/unblock", dependencies=[Depends(require_lab_admin)])
+async def http_flood_unblock() -> dict:
+    try:
+        return await http_flood_simulator.unblock()
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/api/attack-lab/http-flood/state")
+async def http_flood_state() -> dict:
+    return http_flood_simulator.get_state()
+
+
+@router.get("/api/attack-lab/http-flood/ui.js")
+async def http_flood_script() -> Response:
+    from backend.http_flood_ui import SCRIPT_PATH
+    return Response(SCRIPT_PATH.read_text(encoding="utf-8"), media_type="text/javascript")
 
 
 @router.get("/api/attack-lab/status")
@@ -306,7 +408,7 @@ def attack_lab_status() -> dict:
     }
 
 
-@router.post("/api/attack-lab/burst", status_code=204)
+@router.post("/api/attack-lab/burst", status_code=204, dependencies=[Depends(require_local_lab_admin)])
 def attack_lab_burst(request: Request, x_admin_token: str | None = Header(default=None)) -> Response:
     peer_host = request.client.host if request.client else ""
     from backend.chat_service import resolve_client_ip

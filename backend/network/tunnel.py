@@ -63,6 +63,7 @@ class TunnelManager:
         public_hostname: Optional[str] = None,
         local_port: Optional[int] = None,
         cloudflared_path: Optional[str] = None,
+        mode: Optional[str] = None,
     ):
         self._lock = threading.RLock()
         self.token = (
@@ -70,6 +71,9 @@ class TunnelManager:
             if token is not None
             else (CLOUDFLARE_TUNNEL_TOKEN or os.getenv("CLOUDFLARE_TUNNEL_TOKEN", "")).strip()
         ) or None
+        self.mode = mode or ("named" if self.token else os.getenv("CLOUDFLARE_TUNNEL_MODE", "disabled").lower())
+        if self.mode not in ("named", "quick", "disabled"):
+            raise ValueError("CLOUDFLARE_TUNNEL_MODE must be named, quick or disabled")
 
         raw_hostname = (
             public_hostname
@@ -77,6 +81,8 @@ class TunnelManager:
             else (CLOUDFLARE_PUBLIC_HOSTNAME or os.getenv("CLOUDFLARE_PUBLIC_HOSTNAME", "")).strip()
         )
         self.public_hostname = self._clean_hostname(raw_hostname)
+        if self.mode == "quick":
+            self.public_hostname = None  # Assigned only by this process's startup banner.
 
         self.local_port = int(
             local_port
@@ -89,15 +95,19 @@ class TunnelManager:
             else (CLOUDFLARE_PATH or os.getenv("CLOUDFLARE_PATH", "cloudflared")).strip()
         )
 
-        self.status = "disabled" if not self.token else "starting"
+        self.status = "starting" if self.token or self.mode == "quick" else "disabled"
         self.error: Optional[str] = None
         self.process: Optional[subprocess.Popen] = None
         self._monitor_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._connected_event = threading.Event()
         self._recent_logs: list[str] = []
+        self._active_connections: set[str] = set()
+        self._local_ip_cache: Optional[str] = None
+        self._local_ip_checked = 0.0
+        self._local_ip_refresh_lock = threading.Lock()
 
-        if not self.token:
+        if not self.token and self.mode != "quick":
             self.status = "disabled"
             self.error = "Cloudflare Tunnel token is not configured in .env. Local LAN access is fully active."
 
@@ -114,7 +124,19 @@ class TunnelManager:
 
     @property
     def local_ip(self) -> str:
-        return get_lan_ipv4()
+        now = time.monotonic()
+        if self._local_ip_cache and now - self._local_ip_checked < 10:
+            return self._local_ip_cache
+        # Only one caller performs native discovery. Other status/QR readers
+        # keep using the last known address instead of tying up worker threads.
+        if not self._local_ip_refresh_lock.acquire(blocking=False):
+            return self._local_ip_cache or "127.0.0.1"
+        try:
+            self._local_ip_cache = get_lan_ipv4()
+            self._local_ip_checked = time.monotonic()
+            return self._local_ip_cache
+        finally:
+            self._local_ip_refresh_lock.release()
 
     @property
     def local_url(self) -> str:
@@ -142,6 +164,8 @@ class TunnelManager:
     @property
     def readiness_note(self) -> str:
         if self.status == "running" and self.public_hostname:
+            if self.mode == "quick":
+                return "Quick Tunnel edge registered. Temporary public URL assigned; public HTTPS/WSS reachability requires independent verification."
             return (
                 "Cloudflare Edge tunnel registered. Public hostname reachability is unverified "
                 "(requires DNS and ingress routing configured in Cloudflare Zero Trust dashboard)."
@@ -184,7 +208,7 @@ class TunnelManager:
     def start(self) -> bool:
         """Starts cloudflared in a background process using the configured named tunnel token."""
         with self._lock:
-            if not self.token:
+            if self.mode == "disabled" or (not self.token and self.mode != "quick"):
                 self.status = "disabled"
                 self.error = "Cloudflare Tunnel token is not configured in .env. Local LAN access is fully active."
                 log.info("[TUNNEL] %s", self.error)
@@ -210,9 +234,18 @@ class TunnelManager:
             self.status = "starting"
             self.error = None
             self._recent_logs = []
+            self._active_connections.clear()
+            if self.mode == "quick":
+                self.public_hostname = None
 
-            # Launch cloudflared with token (output captured securely)
-            cmd = [executable, "tunnel", "run", "--token", self.token]
+            # Use cloudflared's supported environment variable so credentials
+            # never appear in command-line process listings or command logs.
+            cmd = ([executable, "tunnel", "--url", f"http://127.0.0.1:{self.local_port}", "--no-autoupdate"]
+                   if self.mode == "quick" else [executable, "tunnel", "run"])
+            child_env = {key:value for key,value in os.environ.items()
+                         if key not in ("ADMIN_TOKEN", "CLOUDFLARE_TUNNEL_TOKEN", "TUNNEL_TOKEN", "TUNNEL_TOKEN_FILE")}
+            if self.mode == "named":
+                child_env["TUNNEL_TOKEN"] = self.token
             try:
                 self.process = subprocess.Popen(
                     cmd,
@@ -220,6 +253,7 @@ class TunnelManager:
                     stderr=subprocess.STDOUT,
                     text=True,
                     bufsize=1,
+                    env=child_env,
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                 )
                 log.info("[TUNNEL] cloudflared launched with PID %d", self.process.pid)
@@ -240,7 +274,7 @@ class TunnelManager:
     def _monitor_output(self) -> None:
         """Reads cloudflared logs to confirm connection to Cloudflare Edge or capture errors."""
         connection_pattern = re.compile(
-            r"Registered tunnel connection|Connection .* registered|INF Registered tunnel connection",
+            r"\bRegistered tunnel connection\b|Connection .* registered|INF Registered tunnel connection",
             re.IGNORECASE,
         )
         error_pattern = re.compile(
@@ -251,6 +285,8 @@ class TunnelManager:
         try:
             for line in iter(self.process.stdout.readline, ""):
                 line_s = line.strip()
+                if self.token:
+                    line_s = line_s.replace(self.token, "[redacted]")
                 if not line_s:
                     continue
 
@@ -258,14 +294,35 @@ class TunnelManager:
                     self._recent_logs.append(line_s)
                     if len(self._recent_logs) > 50:
                         self._recent_logs.pop(0)
+                    if self.mode == "quick" and not self.public_hostname:
+                        public = re.search(r"https://([a-z0-9-]+\.trycloudflare\.com)\b", line_s, re.IGNORECASE)
+                        if public:
+                            self.public_hostname = public.group(1).lower()
+                            log.info("[TUNNEL] Quick Tunnel URL: https://%s", self.public_hostname)
 
                 # Check for successful Edge connection
                 if connection_pattern.search(line_s):
                     with self._lock:
+                        index = re.search(r"connIndex=(\d+)", line_s)
+                        self._active_connections.add(index.group(1) if index else "unknown")
                         self.status = "running"
                         self.error = None
                         self._connected_event.set()
                     log.info("[TUNNEL] cloudflared successfully connected to Cloudflare Edge!")
+
+                # cloudflared reconnects its own edge connections. A single
+                # disconnected edge doesn't imply all other connections failed.
+                elif re.search(r"connection terminated|lost connection|failed to serve.*connection|unregistered tunnel connection", line_s, re.IGNORECASE):
+                    with self._lock:
+                        index = re.search(r"connIndex=(\d+)", line_s)
+                        if index:
+                            self._active_connections.discard(index.group(1))
+                        else:
+                            self._active_connections.clear()
+                        if not self._active_connections:
+                            self.status = "reconnecting"
+                            self._connected_event.clear()
+                            self.error = "Cloudflare edge connection interrupted; cloudflared is reconnecting."
 
                 # Check for critical errors
                 elif error_pattern.search(line_s) and self.status != "running":
@@ -309,12 +366,17 @@ class TunnelManager:
                     pass
 
             self.process = None
+            self._active_connections.clear()
+            self._connected_event.clear()
             if self.status != "disabled":
                 self.status = "stopped"
             return True
 
     def status_dict(self) -> dict:
         """Returns the public and local URL state without exposing the secret tunnel token."""
+        # Never hold the tunnel lifecycle lock across Windows adapter discovery.
+        local_ip = self.local_ip
+        local_url = f"http://{local_ip}:{self.local_port}"
         with self._lock:
             # Check process liveness if marked as running
             if self.process and self.process.poll() is not None and self.status == "running":
@@ -323,15 +385,20 @@ class TunnelManager:
                 self.error = f"cloudflared process terminated (exit code: {code})"
 
             return {
-                "enabled": bool(self.token),
+                "enabled": bool(self.token) or self.mode == "quick",
+                "mode": self.mode,
                 "status": self.status,
                 "edge_connected": self.edge_connected,
                 "public_hostname": self.public_hostname,
                 "public_hostname_verified": self.public_hostname_verified,
                 "public_url": self.public_url,
-                "local_ip": self.local_ip,
-                "local_url": self.local_url,
-                "active_joining_url": self.active_joining_url,
+                "configured_public_url": f"https://{self.public_hostname}" if self.public_hostname else None,
+                "attack_lab_url": f"{self.public_url or local_url}/attack-lab",
+                "dashboard_url": f"{self.public_url or local_url}/dashboard",
+                "dashboard_websocket_url": f"{self.public_url.replace('https://', 'wss://') if self.public_url else local_url.replace('http://', 'ws://')}/ws/dashboard",
+                "local_ip": local_ip,
+                "local_url": local_url,
+                "active_joining_url": f"{self.public_url or local_url}/chat",
                 "joining_mode": self.joining_mode,
                 "is_public_ready": self.is_public_ready,
                 "readiness_note": self.readiness_note,

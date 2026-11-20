@@ -105,7 +105,7 @@ Write-Host "                    New-NetFirewallRule -DisplayName 'Sentinel AI LA
 Write-Host "`nStarting Sentinel server on ${HostBinding}:${Port}..." -ForegroundColor Yellow
 Write-Host "Press Ctrl+C to stop.`n" -ForegroundColor Gray
 
-& $venvPython -m uvicorn app:app --host $HostBinding --port $Port
+& $venvPython -m uvicorn app:app --host $HostBinding --port $Port --no-proxy-headers
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Sentinel server stopped with exit code $LASTEXITCODE."
     exit $LASTEXITCODE

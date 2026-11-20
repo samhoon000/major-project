@@ -182,7 +182,7 @@ class EnforcementTests(unittest.TestCase):
 
 class ApiQuarantineTests(unittest.TestCase):
     def setUp(self):
-        self.client = TestClient(app)
+        self.client = TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 50000))
         self.admin_token = "test-secret-admin-token-12345"
 
     def test_quarantine_endpoints_token_protection(self):

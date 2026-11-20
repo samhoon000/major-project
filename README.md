@@ -4,6 +4,8 @@ Sentinel AI is a real-time, unified network security and secure messaging platfo
 
 The system is accessible both locally over Wi-Fi (LAN) and globally across the internet via Cloudflare Tunnel, allowing multiple laptops and mobile phones to connect to the **same** FastAPI application and Threat Engine.
 
+See [How to run Sentinel AI](HOW_TO_RUN.md) for setup, Quick Tunnel access, and a summary of changes on this branch.
+
 ---
 
 ## 1. System Architecture
