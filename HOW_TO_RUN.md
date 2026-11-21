@@ -20,30 +20,77 @@ Setup creates a virtual environment, installs dependencies, checks model assets,
 
 For a manual launch after setup, run `.\venv\Scripts\python.exe -m uvicorn app:app --host 127.0.0.1 --port 8001 --no-proxy-headers` from the repository root. Use one server process. The proxy flag lets the app validate the actual connection peer.
 
-## Optional Cloudflare access
+## Part 1 — Publish Sentinel AI with Cloudflare Quick Tunnel
 
-1. Install [cloudflared](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/) and put it on PATH or place `cloudflared.exe` in the repository root.
-2. In your local `.env`, set the following values and keep the generated `ADMIN_TOKEN`:
+Only the Windows laptop or VM hosting Sentinel needs `cloudflared`. Teammates can join with a browser and internet access. A Quick Tunnel is free for development and provides a temporary HTTPS address without a Cloudflare account or custom domain. [Cloudflare Quick Tunnel docs](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)
+
+### Download and verify cloudflared
+
+1. Download the **Windows 64-bit executable** from [Cloudflare Downloads](https://developers.cloudflare.com/tunnel/downloads/).
+2. Create a `cloudflared` folder on the host's Desktop. Put the executable there and rename it to `cloudflared.exe`.
+3. In PowerShell, verify that the executable reports its version.
+
+   ```powershell
+   $cloudflared = Join-Path ([Environment]::GetFolderPath('DesktopDirectory')) 'cloudflared\cloudflared.exe'
+   & $cloudflared --version
+   ```
+
+### Verify Sentinel locally
+
+Complete [the local setup](#start-locally) first. If Sentinel is already running from that section, keep its PowerShell window open. Otherwise, open PowerShell in your project folder and start Sentinel on port **8001**, the project's default.
+
+```powershell
+.\start.ps1 -HostBinding 127.0.0.1 -Port 8001
+```
+
+In a second PowerShell window, confirm `TcpTestSucceeded : True` and open [local Chat](http://127.0.0.1:8001/chat).
+
+```powershell
+Test-NetConnection 127.0.0.1 -Port 8001
+```
+
+Choose one way to start the tunnel. Sentinel can start it automatically, or you can run the connector in the second window.
+
+### Let Sentinel start the tunnel
+
+1. Put `cloudflared.exe` on PATH or place a copy in the repository root. In the project’s local `.env`, set the following values and keep the generated `ADMIN_TOKEN`.
 
    ```dotenv
    PORT=8001
    CLOUDFLARE_TUNNEL_MODE=quick
    CLOUDFLARE_TUNNEL_TOKEN=
    CLOUDFLARE_PUBLIC_HOSTNAME=
-   HTTP_FLOOD_REMOTE_ENABLED=true
+   DASHBOARD_REMOTE_ENABLED=true
+   HTTP_FLOOD_REMOTE_ENABLED=false
    NETWORK_AUTO_QUARANTINE=false
    ```
 
-3. Restart the server using the loopback launch command above. Once the tunnel reports `running`, read the current links at [local tunnel status](http://127.0.0.1:8001/api/tunnel/state), or run:
+2. Restart Sentinel with the same loopback launch command. Once the tunnel reports `running`, read the current links at [local tunnel status](http://127.0.0.1:8001/api/tunnel/state), or run:
 
    ```powershell
    Invoke-RestMethod http://127.0.0.1:8001/api/tunnel/state |
-       Select-Object status, edge_connected, public_url, attack_lab_url, dashboard_url
+       Select-Object status, edge_connected, public_url, dashboard_url
    ```
 
-4. Open the returned HTTPS links. Append `/chat` to the public base URL for Chat. Authenticate separately in each browser profile that needs dashboard telemetry or lab controls. Tunnel restarts can assign a new hostname.
+### Start the tunnel in a second PowerShell window
 
-Quick mode needs no Cloudflare account or tunnel token. Use it for temporary demos. If the connector reports `running` but the browser shows an address error, check DNS and try from an approved network. For named tunnels, authentication details, and troubleshooting, see the [HTTP demo guide](docs/HTTP_FLOOD_DEMO.md).
+Use this option when you want to run the connector yourself. Set `CLOUDFLARE_TUNNEL_MODE=disabled`, leave `CLOUDFLARE_TUNNEL_TOKEN` blank, set `DASHBOARD_REMOTE_ENABLED=true`, and keep `HTTP_FLOOD_REMOTE_ENABLED=false`. Start or restart Sentinel on loopback and finish the local check above. Run the command below in the second PowerShell window.
+
+```powershell
+$cloudflared = Join-Path ([Environment]::GetFolderPath('DesktopDirectory')) 'cloudflared\cloudflared.exe'
+& $cloudflared tunnel --url http://127.0.0.1:8001
+```
+
+Wait for `Registered tunnel connection`. Copy the generated hostname, for example `something-random.trycloudflare.com`, into `CLOUDFLARE_PUBLIC_HOSTNAME` in `.env`. Restart Sentinel once so it recognizes the public hostname. Keep both PowerShell windows running. If you restart `cloudflared` and get a new hostname, update `.env` and restart Sentinel again.
+
+### Share Chat and open the dashboard
+
+- Share `https://something-random.trycloudflare.com/chat` with your teammates. Replace the example hostname with the one Cloudflare assigned. Anyone with the link can join Chat.
+- Open `https://something-random.trycloudflare.com/dashboard`, enter the local `ADMIN_TOKEN`, and select **Authenticate** to view telemetry or unblock users.
+
+Keep Sentinel and its tunnel running while people use the links. Quick Tunnel URLs can change when the connector restarts, and uptime is not guaranteed. [Cloudflare Quick Tunnel docs](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)
+
+The SOC dashboard continues to show captured network activity when nobody has joined Chat. GATv2 findings appear as alerts only when the captured flow matches an active direct chat connection. Cloudflare-relayed chat uses message, URL, and behavior checks, and the timeline records those moderation actions.
 
 ## What changed on this branch
 

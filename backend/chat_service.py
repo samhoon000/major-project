@@ -12,15 +12,16 @@ from collections import defaultdict, deque
 from typing import Any
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, Response
-from fastapi import HTTPException, Header
+from fastapi import HTTPException
+from backend.security.blocking import blocking_manager
 from backend.security.live_behavior_analyzer import BehaviorAnalyzer, BehaviorConfig
 from backend.security.message_analyzer import message_analyzer
 from backend.security.url_analyzer import url_analyzer
 from backend.security.threat_engine import threat_engine
 import ipaddress
-from backend.security.demo_access import demo_security
+from backend.security.demo_access import boundary, demo_security, public_origin
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -224,7 +225,7 @@ class ChatState:
     def __init__(self) -> None:
         self.clients: dict[str, WebSocket] = {}
         self.client_ips: dict[str, str] = {}
-        self.client_endpoints: dict[str, tuple[str, int, int]] = {}
+        self.client_endpoints: dict[str, tuple[str, int, str, int, str]] = {}
         self.blocked: set[str] = set()
         self.block_reasons: dict[str, str] = {}
         self.recent: deque[dict[str, Any]] = deque(maxlen=200)
@@ -232,25 +233,27 @@ class ChatState:
         self.sent: dict[str, deque[tuple[float, str, str]]] = defaultdict(deque)
         self.lock = asyncio.Lock()
 
-    def flow_matches_client(self, flow: dict[str, Any], username: str) -> bool:
-        endpoint = self.client_endpoints.get(username)
+    @staticmethod
+    def _flow_matches_endpoint(flow: dict[str, Any], endpoint: tuple[str, int, str, int, str] | None) -> bool:
         if not endpoint or str(flow.get("protocol", "")).upper() != "TCP":
             return False
-        client_ip, client_port, server_port = endpoint
-        return (
-            flow.get("source_ip") == client_ip
-            and int(flow.get("source_port", -1)) == client_port
-            and int(flow.get("destination_port", -1)) == server_port
-        ) or (
-            flow.get("destination_ip") == client_ip
-            and int(flow.get("destination_port", -1)) == client_port
-            and int(flow.get("source_port", -1)) == server_port
-        )
+        client_ip, client_port, server_ip, server_port, session_id = endpoint
+        packet_session = flow.get("chat_session_id")
+        if packet_session is not None and packet_session != session_id:
+            return False
+        source = (flow.get("source_ip"), flow.get("source_port"))
+        destination = (flow.get("destination_ip"), flow.get("destination_port"))
+        client = (client_ip, client_port)
+        server = (server_ip, server_port)
+        return (source == client and destination == server) or (source == server and destination == client)
 
-    def resolve_flow_user(self, flow: dict[str, Any]) -> str:
-        matches = [username for username in self.client_endpoints
-                   if self.flow_matches_client(flow, username)]
-        return matches[0] if len(matches) == 1 else "UNKNOWN"
+    def flow_matches_client(self, flow: dict[str, Any], username: str) -> bool:
+        return self._flow_matches_endpoint(flow, self.client_endpoints.get(username))
+
+    def resolve_flow_session(self, flow: dict[str, Any]) -> tuple[str, str] | None:
+        matches = [(username, endpoint[4]) for username, endpoint in self.client_endpoints.copy().items()
+                   if self._flow_matches_endpoint(flow, endpoint)]
+        return matches[0] if len(matches) == 1 else None
 
     async def event(self, kind: str, data: dict[str, Any]) -> None:
         item = {"type": kind, "timestamp": time.time(), **data}
@@ -258,18 +261,33 @@ class ChatState:
         await self.broadcast_dashboard(item)
 
     async def broadcast_dashboard(self, item: dict[str, Any]) -> None:
-        dead = []
-        for ws in list(dashboard_clients):
+        for ws in tuple(dashboard_clients):
             try:
                 if not demo_security.can_view(ws):
                     await ws.close(code=1008)
-                    dead.append(ws)
+                    dashboard_clients.discard(ws)
                     continue
                 await ws.send_json(item)
             except Exception:
-                dead.append(ws)
-        for ws in dead:
-            dashboard_clients.discard(ws)
+                dashboard_clients.discard(ws)
+
+    def dashboard_roster(self) -> dict[str, Any]:
+        blocked_client_ips = {name: record["ip"] for name in self.blocked
+                              if (record := blocking_manager.get_block_info(name)) and record["ip"]}
+        return {"users": sorted(self.clients), "blocked": sorted(self.blocked),
+                "client_ips": dict(self.client_ips), "block_reasons": dict(self.block_reasons),
+                "blocked_client_ips": blocked_client_ips}
+
+    def blocked_username(self, username: str) -> str | None:
+        key = username.casefold()
+        return next((name for name in self.blocked if name.casefold() == key), None)
+
+    def chat_block_message(self, username: str, client_ip: str | None) -> str | None:
+        if blocking_manager.is_ip_blocked(client_ip):
+            return "Your IP address has been blocked. You cannot join Sentinel AI Chat from this address."
+        if self.blocked_username(username) is not None or blocking_manager.is_user_blocked(username):
+            return "This username has been blocked from Sentinel AI Chat."
+        return None
 
     async def roster(self) -> None:
         payload = {"type": "users", "users": sorted(self.clients), "blocked": sorted(self.blocked)}
@@ -278,6 +296,7 @@ class ChatState:
                 await ws.send_json(payload)
             except Exception:
                 pass
+        await self.broadcast_dashboard({"type": "users", **self.dashboard_roster()})
 
 
 state = ChatState()
@@ -339,34 +358,185 @@ DASHBOARD_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 </style></head><body><main class="shell">
 <header class="top"><div class="brand"><div class="sigil">⌁</div><div><div class="eyebrow">SENTINEL // NETWORK DEFENSE</div><h1 class="title">SECURITY ADMIN CONSOLE</h1><div class="subtitle">LIVE TELEMETRY / GATv2 INFERENCE / FLOW MONITOR</div></div></div><div class="top-right"><span class="live wait" id="liveIndicator">CONNECTING</span><nav class="nav"><a href="/attack-lab">ATTACK LAB</a><a href="/chat">SECURE CHAT</a></nav></div></header>
 <section class="banner wait" id="warningBanner"><div class="banner-main"><span class="banner-icon" id="bannerIcon">◌</span><div><div class="banner-title" id="bannerTitle">INITIALIZING LIVE STATE</div><div class="banner-copy" id="bannerCopy">Waiting for network capture and model status.</div></div></div><div class="banner-meta" id="bannerMeta">LAST UPDATE: —</div></section>
-<div class="grid stats"><div class="stat"><div class="stat-label">Packets / Sec</div><div class="stat-value cyan" id="pps">—</div><div class="stat-note">LIVE CAPTURE WINDOW</div></div><div class="stat"><div class="stat-label">Bytes / Sec</div><div class="stat-value cyan" id="bps">—</div><div class="stat-note">LIVE CAPTURE WINDOW</div></div><div class="stat"><div class="stat-label">Active Flows</div><div class="stat-value" id="active">—</div><div class="stat-note">OBSERVED BY FLOW TRACKER</div></div><div class="stat"><div class="stat-label">GATv2 Analyses</div><div class="stat-value" id="analyses">—</div><div class="stat-note">COMPLETED INFERENCES</div></div><div class="stat"><div class="stat-label">Anomalies</div><div class="stat-value" id="anomalies">—</div><div class="stat-note">GATv2 ATTACK PREDICTIONS</div></div><div class="stat"><div class="stat-label">Online Users</div><div class="stat-value" id="users">—</div><div class="stat-note">SECURE CHAT</div></div></div>
-<div class="grid main-grid"><section class="panel"><div class="panel-head"><div><h2 class="panel-title">LIVE NETWORK ACTIVITY</h2><div class="panel-kicker">PACKETS PER SECOND // ROLLING 60 SECOND WINDOW</div></div><div class="legend"><span><i class="key"></i>CAPTURED TRAFFIC</span><span><i class="key red"></i>GATv2 ATTACK EVENT</span></div></div><div class="chart-wrap"><svg id="activityGraph" viewBox="0 0 900 260" role="img" aria-label="Captured packet rate over the last 60 seconds"></svg></div><div class="chart-foot"><span>TIME →</span><span id="chartRange">LAST 60 SECONDS</span></div></section>
-<section class="panel"><div class="panel-head"><div><h2 class="panel-title">GATv2 // MODEL INFERENCE</h2><div class="panel-kicker">EXISTING MODEL OUTPUT / SAVED CLASSIFICATION THRESHOLD</div></div><span class="tag" id="modelTag">MODEL —</span></div><div class="readout-item"><div class="label">LATEST PREDICTION</div><div class="value" id="latest">WAITING FOR ANALYSIS</div></div><div class="prob-track"><div class="prob-fill" id="probFill"></div><div class="prob-marker" id="probMarker"></div></div><div class="prob-scale"><span>0.00</span><span id="thresholdLabel">THRESHOLD —</span><span>1.00</span></div><div class="prob-caption"><span class="small">ANOMALY PROBABILITY</span><strong id="probability">—</strong></div><div class="incident" id="incidentPanel"><div class="incident-label">LATEST GATv2 ATTACK EVENT</div><div class="incident-empty">No GATv2 ATTACK event in the received security event history.</div></div></section></div>
-<div class="grid lower-grid" style="margin-top:12px"><section class="panel"><div class="panel-head"><div><h2 class="panel-title">OBSERVED NETWORK TOPOLOGY</h2><div class="panel-kicker">ENDPOINTS FROM REAL CAPTURED FLOWS</div></div><span class="tag" id="topologyCount">0 OBSERVED HOSTS</span></div><div class="topology" id="topology"></div></section><section class="panel"><div class="panel-head"><div><h2 class="panel-title">ATTACK HISTORY // TIMELINE</h2><div class="panel-kicker">GATv2 ATTACK PREDICTIONS FROM LIVE EVENT STREAM</div></div><span class="tag" id="threats">0 EVENTS</span></div><div class="timeline" id="attackHistory"></div></section></div>
+<div class="grid stats"><div class="stat"><div class="stat-label">Packets / Sec</div><div class="stat-value cyan" id="pps">—</div><div class="stat-note">LIVE CAPTURE WINDOW</div></div><div class="stat"><div class="stat-label">Bytes / Sec</div><div class="stat-value cyan" id="bps">—</div><div class="stat-note">LIVE CAPTURE WINDOW</div></div><div class="stat"><div class="stat-label">Active Flows</div><div class="stat-value" id="active">—</div><div class="stat-note">OBSERVED BY FLOW TRACKER</div></div><div class="stat"><div class="stat-label">GATv2 Analyses</div><div class="stat-value" id="analyses">—</div><div class="stat-note">COMPLETED INFERENCES</div></div><div class="stat"><div class="stat-label">Anomalies</div><div class="stat-value" id="anomalies">—</div><div class="stat-note">GATv2 CHAT FLOW ANOMALIES</div></div><div class="stat"><div class="stat-label">Online Users</div><div class="stat-value" id="users">—</div><div class="stat-note">SECURE CHAT</div></div></div>
+<div class="grid main-grid"><section class="panel"><div class="panel-head"><div><h2 class="panel-title">LIVE NETWORK ACTIVITY</h2><div class="panel-kicker">PACKETS PER SECOND // ROLLING 60 SECOND WINDOW</div></div><div class="legend"><span><i class="key"></i>CAPTURED TRAFFIC</span><span><i class="key red"></i>GATv2 CHAT FLOW ANOMALY</span></div></div><div class="chart-wrap"><svg id="activityGraph" viewBox="0 0 900 260" role="img" aria-label="Captured packet rate over the last 60 seconds"></svg></div><div class="chart-foot"><span>TIME →</span><span id="chartRange">LAST 60 SECONDS</span></div></section>
+<section class="panel"><div class="panel-head"><div><h2 class="panel-title">GATv2 // MODEL INFERENCE</h2><div class="panel-kicker">EXISTING MODEL OUTPUT / SAVED CLASSIFICATION THRESHOLD</div></div><span class="tag" id="modelTag">MODEL —</span></div><div class="readout-item"><div class="label">LATEST PREDICTION</div><div class="value" id="latest">WAITING FOR ANALYSIS</div></div><div class="prob-track"><div class="prob-fill" id="probFill"></div><div class="prob-marker" id="probMarker"></div></div><div class="prob-scale"><span>0.00</span><span id="thresholdLabel">THRESHOLD —</span><span>1.00</span></div><div class="prob-caption"><span class="small">ANOMALY PROBABILITY</span><strong id="probability">—</strong></div><div class="incident" id="incidentPanel"><div class="incident-label">LATEST GATv2 CHAT FLOW ANOMALY</div><div class="incident-empty">No current GATv2 chat-flow alert.</div></div></section></div>
+<div class="grid lower-grid" style="margin-top:12px"><section class="panel"><div class="panel-head"><div><h2 class="panel-title">OBSERVED NETWORK TOPOLOGY</h2><div class="panel-kicker">ENDPOINTS FROM REAL CAPTURED FLOWS</div></div><span class="tag" id="topologyCount">0 OBSERVED HOSTS</span></div><div class="topology" id="topology"></div></section><section class="panel"><div class="panel-head"><div><h2 class="panel-title">ATTACK HISTORY // TIMELINE</h2><div class="panel-kicker">CHAT MODERATION AND MATCHED GATv2 ALERTS</div></div><span class="tag" id="threats">0 EVENTS</span></div><div class="timeline" id="attackHistory"></div></section></div>
 <div class="grid lower-grid" style="margin-top:12px"><section class="panel"><div class="panel-head"><div><h2 class="panel-title">SECURITY EVENTS // LIVE TERMINAL</h2><div class="panel-kicker">WEBSOCKET EVENT STREAM + API SNAPSHOT</div></div><span class="tag" id="eventCount">0 EVENTS</span></div><div class="terminal" id="events" aria-live="polite"></div></section><section class="panel"><div class="panel-head"><div><h2 class="panel-title">FLOW TELEMETRY</h2><div class="panel-kicker">LATEST CAPTURED FLOWS / NO SYNTHETIC HOSTS</div></div></div><div class="small" id="captureStatus">Waiting for API state.</div><div class="readout" style="margin-top:10px"><div class="readout-item"><div class="label">NEW FLOWS / 60 SEC</div><div class="value" id="newFlows">0</div></div><div class="readout-item"><div class="label">CURRENT CHAT BLOCKS</div><div class="value" id="blocked">0</div></div><div class="readout-item"><div class="label">MESSAGES / SEC</div><div class="value" id="mps">0</div></div><div class="readout-item"><div class="label">CHAT SECURITY EVENTS</div><div class="value" id="eventCount2">0</div></div></div></section></div>
-<section class="panel" style="margin-top:12px"><div class="user-head"><div class="panel-head" style="border:0;margin:0;padding:0"><div><h2 class="panel-title">USER SECURITY</h2><div class="panel-kicker">LIVE CHAT RISK / ADMIN UNBLOCK</div></div></div><div class="user-actions"><input id="adminToken" class="token" type="password" placeholder="Admin token" aria-label="Admin token"><button id="refreshButton" type="button">REFRESH</button></div></div><div class="table-wrap" style="margin-top:12px"><table class="user-table"><thead><tr><th>USERNAME</th><th>CLIENT IP</th><th>STATUS</th><th>MESSAGES</th><th>MSG/SEC</th><th>RISK</th><th>REASON</th><th>ACTION</th></tr></thead><tbody id="userRows"></tbody></table></div></section>
+<section class="panel" style="margin-top:12px"><div class="user-head"><div class="panel-head" style="border:0;margin:0;padding:0"><div><h2 class="panel-title">USER SECURITY</h2><div class="panel-kicker">CONNECTED CHAT USERS</div></div></div><div class="user-actions"><button id="refreshButton" type="button">REFRESH</button></div></div><div class="table-wrap" style="margin-top:12px"><table class="user-table"><thead><tr><th>USERNAME</th><th>CLIENT IP</th><th>STATUS</th><th>MESSAGES</th><th>MSG/SEC</th><th>RISK</th></tr></thead><tbody id="userRows"></tbody></table></div>
+<details id="blockedUsers" hidden style="margin-top:12px"><summary>Manage blocked accounts</summary><div class="table-wrap"><table><thead><tr><th>USERNAME</th><th>BLOCKED IP</th><th>REASON</th><th>ACTION</th></tr></thead><tbody id="blockedUserRows"></tbody></table></div></details></section>
 <section class="panel" style="margin-top:12px"><div class="panel-head"><div><h2 class="panel-title">LIVE NETWORK FLOWS</h2><div class="panel-kicker">CAPTURED FLOW TRACKER RECORDS AND GATv2 RESULTS</div></div><span class="tag" id="flowCount">0 FLOWS</span></div><div class="table-wrap"><table><thead><tr><th>TIME</th><th>SOURCE</th><th>DESTINATION</th><th>PROTO</th><th>PACKETS</th><th>BYTES</th><th>GATv2</th><th>PROBABILITY</th></tr></thead><tbody id="flows"></tbody></table></div></section>
 <section class="panel" style="margin-top:12px"><div class="panel-head"><div><h2 class="panel-title">ACCESS &amp; CONNECTIVITY // CLOUDFLARE TUNNEL &amp; LOCAL LAN</h2><div class="panel-kicker">MULTI-DEVICE JOINING URLS &amp; REAL-TIME QR CODE</div></div><span class="tag" id="tunnelStatusTag">TUNNEL —</span></div><div style="display:flex;gap:20px;align-items:center;flex-wrap:wrap;padding:6px 0"><div style="background:#fff;padding:8px;border-radius:8px;display:inline-block;line-height:0" id="dashboardQrWrap"><img id="dashboardQrImg" src="/api/tunnel/qr.svg" width="120" height="120" alt="Join QR Code" style="display:block"></div><div style="flex:1;min-width:240px;display:grid;gap:8px"><div class="readout-item"><div class="label">ACTIVE JOINING URL (<span id="joiningModeLabel">LOCAL LAN</span>)</div><div class="value" style="font-size:13px;font-weight:600;color:var(--green)" id="activeJoiningUrl">—</div></div><div style="display:flex;gap:16px;flex-wrap:wrap"><div class="readout-item"><div class="label">PUBLIC CLOUDFLARE URL</div><div class="value" id="publicTunnelUrl">—</div></div><div class="readout-item"><div class="label">LOCAL WI-FI (LAN) URL</div><div class="value" id="localLanUrl">—</div></div></div><div class="small" id="tunnelDetailNote" style="color:var(--muted)">Checking tunnel status...</div></div></div></section>
 <footer class="footer"><span id="interfaceInfo">CAPTURE INTERFACE: UNKNOWN</span><span>ATTACK CLASSIFICATION IS PROVIDED BY THE EXISTING GATv2 PIPELINE.</span><span id="updatedAt">UPDATED: —</span></footer></main>
 <script>
 const $=id=>document.getElementById(id);const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));let events=[],networkState=null,chatState=null,samples=[],socket=null,dashboardRefreshBusy=false;const sampleLimit=31;function eventKey(x){return [x.timestamp,x.type,x.flow_id,x.message_id,x.username,x.source_ip].join('|')}function mergeEvents(incoming){const map=new Map(events.map(x=>[eventKey(x),x]));(incoming||[]).forEach(x=>{if(x&&x.type)map.set(eventKey(x),x)});events=Array.from(map.values()).sort((a,b)=>(a.timestamp||0)-(b.timestamp||0)).slice(-500)}function attackEvents(){return events.filter(x=>x.type==='gatv2_analysis'&&(x.gatv2_prediction==='ATTACK'||x.prediction==='ATTACK'))}function timeText(ts){return ts?new Date(ts*1000).toLocaleTimeString(): '—'}function formatRate(value){return Number(value||0).toLocaleString(undefined,{maximumFractionDigits:1})}function formatBytes(value){const n=Number(value||0);if(n<1024)return n.toFixed(0)+' B/s';if(n<1048576)return (n/1024).toFixed(1)+' KB/s';return (n/1048576).toFixed(2)+' MB/s'}function privateIp(ip){if(!ip)return false;if(ip==='::1'||ip.indexOf('fc')===0||ip.indexOf('fd')===0)return true;const m=ip.match(/^(\d{1,3})\.(\d{1,3})\./);if(!m)return false;const a=Number(m[1]),b=Number(m[2]);return a===10||a===127||(a===192&&b===168)||(a===172&&b>=16&&b<=31)}function getFlow(id){if(!networkState)return null;return (networkState.completed_flows||[]).find(f=>f.flow_id===id)||null}
-function drawGraph(){const svg=$('activityGraph');const w=900,h=260,left=48,right=15,top=12,bottom=24,pw=w-left-right,ph=h-top-bottom,now=Date.now()/1000,cut=now-60;const points=samples.filter(p=>p.t>=cut);const max=Math.max(1,...points.map(p=>p.v));const ceil=Math.max(5,Math.ceil(max/5)*5);let out='';for(let i=0;i<=4;i++){const val=ceil*(4-i)/4,y=top+ph*i/4;out+='<line x1="'+left+'" y1="'+y+'" x2="'+(w-right)+'" y2="'+y+'" stroke="#1d2c22" stroke-width="1"/><text x="'+(left-8)+'" y="'+(y+3)+'" fill="#728d77" font-size="9" text-anchor="end">'+Math.round(val)+'</text>'}for(let i=0;i<=6;i++){const x=left+pw*i/6;out+='<line x1="'+x+'" y1="'+top+'" x2="'+x+'" y2="'+(top+ph)+'" stroke="#142019" stroke-width="1"/><text x="'+x+'" y="'+(h-5)+'" fill="#728d77" font-size="8" text-anchor="middle">'+(i===6?'NOW':Math.round((i-6)*10)+'s')+'</text>'}if(points.length){const coords=points.map(p=>({x:left+Math.max(0,Math.min(60,p.t-cut))/60*pw,y:top+ph-(Math.min(ceil,p.v)/ceil)*ph}));const line=coords.map(p=>p.x.toFixed(1)+','+p.y.toFixed(1)).join(' ');out+='<polyline points="'+line+'" fill="none" stroke="#54e6ff" stroke-width="2" vector-effect="non-scaling-stroke"/>';const first=coords[0],last=coords[coords.length-1];out+='<polygon points="'+first.x+','+(top+ph)+' '+line+' '+last.x+','+(top+ph)+'" fill="#54e6ff" opacity=".06"/>'}const attacks=attackEvents().filter(x=>x.timestamp>=cut&&x.timestamp<=now);attacks.forEach(a=>{const x=left+(a.timestamp-cut)/60*pw;out+='<line x1="'+x+'" y1="'+top+'" x2="'+x+'" y2="'+(top+ph)+'" stroke="#ff3b4e" stroke-width="1" stroke-dasharray="4 4" opacity=".9"><title>GATv2 ATTACK · '+esc(timeText(a.timestamp))+' · '+esc(a.source_ip||'source unavailable')+'</title></line><path d="M '+(x-5)+' '+(top+ph+1)+' L '+(x+5)+' '+(top+ph+1)+' L '+x+' '+(top+ph-7)+' Z" fill="#ff3b4e"><title>GATv2 ATTACK · '+esc(timeText(a.timestamp))+'</title></path>'});svg.innerHTML=out}
-function renderIncident(n){const attacks=attackEvents(),a=attacks.length?attacks[attacks.length-1]:null,flow=a?getFlow(a.flow_id):null,probRaw=a?(a.anomaly_probability!=null?a.anomaly_probability:(flow&&flow.gatv2_anomaly_probability!=null?flow.gatv2_anomaly_probability:null)):null,prob=probRaw==null?null:Number(probRaw),thresholdRaw=(a&&a.threshold!=null?a.threshold:(flow&&flow.gatv2_threshold!=null?flow.gatv2_threshold:n.gatv2_threshold)),threshold=thresholdRaw==null?null:Number(thresholdRaw);const detected=!!a;const latestIsAttack=n.latest_prediction==='ATTACK';$('latest').textContent=n.latest_prediction||'WAITING FOR ANALYSIS';$('latest').className='value'+(n.latest_prediction==='ATTACK'?' pill attack':'');$('probability').textContent=detected&&prob!=null?(prob*100).toFixed(2)+'%':'—';$('probability').className=latestIsAttack?'attack':'';$('probFill').style.width=detected&&prob!=null?(Math.max(0,Math.min(1,prob))*100)+'%':'0%';$('probFill').className='prob-fill'+(latestIsAttack?' attack':'');$('probMarker').style.display=threshold==null?'none':'block';$('probMarker').style.left=(Math.max(0,Math.min(1,threshold||0))*100)+'%';$('thresholdLabel').textContent=threshold==null?'THRESHOLD —':'THRESHOLD '+threshold.toFixed(2);$('modelTag').textContent=n.gatv2==='available'?'MODEL ONLINE':'MODEL OFFLINE';$('modelTag').className='tag '+(n.gatv2==='available'?'ok':'bad');$('threats').textContent=attacks.length+' EVENTS';$('incidentPanel').innerHTML=detected?'<div class="incident-label">GATv2 ATTACK DETECTED · '+esc(timeText(a.timestamp))+'</div><div class="incident-title">NETWORK ATTACK</div><div class="incident-grid"><div><span class="small">SOURCE DEVICE</span><span class="value">'+esc(a.source_ip||'UNKNOWN LAN DEVICE')+' : '+esc(a.source_port==null?'—':a.source_port)+'</span></div><div><span class="small">SOURCE LOCATION</span><span class="value">'+(privateIp(a.source_ip)?'LOCAL NETWORK / WI-FI':'APPROXIMATE LOCATION NOT PROVIDED')+'</span></div><div><span class="small">TARGET</span><span class="value">'+esc(a.destination_ip||'—')+' : '+esc(a.destination_port==null?'—':a.destination_port)+'</span></div><div><span class="small">PROTOCOL</span><span class="value">'+esc(a.protocol||'—')+'</span></div><div><span class="small">GATv2 PROBABILITY</span><span class="value">'+(prob==null?'NOT PROVIDED':(prob*100).toFixed(2)+'%')+'</span></div><div><span class="small">THRESHOLD</span><span class="value">'+threshold.toFixed(2)+'</span></div><div><span class="small">DEVICE NAME</span><span class="value">UNKNOWN LAN DEVICE</span></div><div><span class="small">ACTION REPORTED</span><span class="value">'+esc(a.action||'ALERT')+' · NO FIREWALL STATUS IN API</span></div></div>':'<div class="incident-empty">No GATv2 ATTACK event in the received security event history. Host identity and physical location are shown only when provided by live services.</div>'}
-function renderBanner(n){const b=$('warningBanner'),indicator=$('liveIndicator'),secure=n.gatv2==='available'&&n.latest_prediction!=='ATTACK';if(n.latest_prediction==='ATTACK'){b.className='banner attack';$('bannerIcon').textContent='⚠';$('bannerTitle').textContent='LATEST GATv2 RESULT // ATTACK';$('bannerCopy').textContent='A real GATv2 ATTACK prediction is the latest model result. Incident details are from the associated captured flow.';indicator.className='live warn';indicator.textContent='ATTACK RESULT'}else if(n.gatv2!=='available'||n.capture!=='running'){b.className='banner wait';$('bannerIcon').textContent='◌';$('bannerTitle').textContent='MONITORING DEGRADED / STATE INCOMPLETE';$('bannerCopy').textContent='Capture: '+(n.capture||'unknown')+' · GATv2: '+(n.gatv2||'unknown')+' · '+(n.gatv2_error||n.capture_error||'waiting for live state');indicator.className='live wait';indicator.textContent='CHECK STATUS'}else{b.className='banner';$('bannerIcon').textContent='●';$('bannerTitle').textContent='NO CURRENT GATv2 ATTACK RESULT';$('bannerCopy').textContent='Latest GATv2 prediction: '+(n.latest_prediction||'none')+'. Historical attack events remain in the timeline.';indicator.className='live';indicator.textContent='LIVE / SECURE'}$('bannerMeta').textContent='LAST UPDATE: '+new Date().toLocaleTimeString()}
-function renderTimeline(){const attacks=attackEvents().slice().reverse();$('attackHistory').innerHTML=attacks.length?attacks.slice(0,60).map(a=>'<div class="timeline-row"><div class="timeline-time">'+esc(timeText(a.timestamp))+'</div><div class="timeline-dot">▲</div><div><div class="desc">GATv2 ATTACK DETECTED</div><div class="sub">'+esc(a.source_ip||'source unavailable')+' → '+esc(a.destination_ip||'target unavailable')+' · '+(Number(a.anomaly_probability!=null?a.anomaly_probability:a.confidence||0)*100).toFixed(2)+'% · '+esc(a.protocol||'')+'</div></div></div>').join(''):'<div class="incident-empty">No GATv2 ATTACK events recorded in the live event history.</div>'}
+function drawGraph(){const svg=$('activityGraph');const w=900,h=260,left=48,right=15,top=12,bottom=24,pw=w-left-right,ph=h-top-bottom,now=Date.now()/1000,cut=now-60;const points=samples.filter(p=>p.t>=cut);const max=Math.max(1,...points.map(p=>p.v));const ceil=Math.max(5,Math.ceil(max/5)*5);let out='';for(let i=0;i<=4;i++){const val=ceil*(4-i)/4,y=top+ph*i/4;out+='<line x1="'+left+'" y1="'+y+'" x2="'+(w-right)+'" y2="'+y+'" stroke="#1d2c22" stroke-width="1"/><text x="'+(left-8)+'" y="'+(y+3)+'" fill="#728d77" font-size="9" text-anchor="end">'+Math.round(val)+'</text>'}for(let i=0;i<=6;i++){const x=left+pw*i/6;out+='<line x1="'+x+'" y1="'+top+'" x2="'+x+'" y2="'+(top+ph)+'" stroke="#142019" stroke-width="1"/><text x="'+x+'" y="'+(h-5)+'" fill="#728d77" font-size="8" text-anchor="middle">'+(i===6?'NOW':Math.round((i-6)*10)+'s')+'</text>'}if(points.length){const coords=points.map(p=>({x:left+Math.max(0,Math.min(60,p.t-cut))/60*pw,y:top+ph-(Math.min(ceil,p.v)/ceil)*ph}));const line=coords.map(p=>p.x.toFixed(1)+','+p.y.toFixed(1)).join(' ');out+='<polyline points="'+line+'" fill="none" stroke="#54e6ff" stroke-width="2" vector-effect="non-scaling-stroke"/>';const first=coords[0],last=coords[coords.length-1];out+='<polygon points="'+first.x+','+(top+ph)+' '+line+' '+last.x+','+(top+ph)+'" fill="#54e6ff" opacity=".06"/>'}const attacks=attackEvents().filter(x=>chatState?.users?.includes(x.username)&&!chatState.blocked?.includes(x.username)&&x.timestamp>=cut&&x.timestamp<=now);attacks.forEach(a=>{const x=left+(a.timestamp-cut)/60*pw;out+='<line x1="'+x+'" y1="'+top+'" x2="'+x+'" y2="'+(top+ph)+'" stroke="#ff3b4e" stroke-width="1" stroke-dasharray="4 4" opacity=".9"><title>GATv2 CHAT FLOW ANOMALY · '+esc(timeText(a.timestamp))+' · '+esc(a.source_ip||'source unavailable')+'</title></line><path d="M '+(x-5)+' '+(top+ph+1)+' L '+(x+5)+' '+(top+ph+1)+' L '+x+' '+(top+ph-7)+' Z" fill="#ff3b4e"><title>GATv2 CHAT FLOW ANOMALY · '+esc(timeText(a.timestamp))+'</title></path>'});svg.innerHTML=out}
+function currentAnalysis(n) {
+  const analysis = n.latest_analysis;
+  if (analysis?.gatv2_prediction === 'BENIGN') return analysis;
+  return analysis && chatState?.users?.includes(analysis.username) &&
+    !chatState.blocked?.includes(analysis.username) ? analysis : null;
+}
+function renderIncident(n){
+  const analysis = currentAnalysis(n);
+  const prediction = analysis?.gatv2_prediction;
+  const probability = analysis?.gatv2_anomaly_probability;
+  const threshold = analysis?.gatv2_threshold ?? n.gatv2_threshold;
+  const flagged = prediction === 'ATTACK';
+  const percentage = probability == null ? '—' : (probability * 100).toFixed(2) + '%';
+  $('latest').textContent = flagged ? 'ANOMALY FLAGGED' : prediction || 'WAITING FOR ANALYSIS';
+  $('latest').className = 'value' + (flagged ? ' pill attack' : '');
+  $('probability').textContent = percentage;
+  $('probability').className = flagged ? 'attack' : '';
+  $('probFill').style.width = probability == null ? '0%' : percentage;
+  $('probFill').className = 'prob-fill' + (flagged ? ' attack' : '');
+  $('probMarker').style.display = threshold == null ? 'none' : 'block';
+  $('probMarker').style.left = (Number(threshold || 0) * 100) + '%';
+  $('thresholdLabel').textContent = threshold == null ? 'THRESHOLD —' : 'THRESHOLD ' + Number(threshold).toFixed(2);
+  const available = n.gatv2 === 'available';
+  $('modelTag').textContent = available ? 'MODEL ONLINE' : 'MODEL OFFLINE';
+  $('modelTag').className = 'tag ' + (available ? 'ok' : 'bad');
+  $('incidentPanel').innerHTML = flagged
+    ? '<div class="incident-label">GATv2 CHAT FLOW ANOMALY</div><div class="incident-title">' + esc(analysis.username) +
+      '</div><div class="small">' + esc(analysis.source_ip) + ':' + esc(analysis.source_port) +
+      ' → ' + esc(analysis.destination_ip) + ':' + esc(analysis.destination_port) + ' · ' + percentage + '</div>'
+    : '<div class="incident-empty">No current GATv2 chat-flow alert. Earlier results appear in the timeline.</div>';
+}
+function renderBanner(n){
+  const banner = $('warningBanner');
+  const indicator = $('liveIndicator');
+  const blocked = new Set(chatState?.blocked || []);
+  const online = (chatState?.users || []).some(username => !blocked.has(username));
+  const analysis = currentAnalysis(n);
+  const prediction = chatState?.users?.includes(analysis?.username) ? analysis.gatv2_prediction : null;
+  let state = 'wait';
+  let title = 'WAITING FOR CHAT USERS';
+  let detail = 'Network activity remains visible. Chat alerts require a joined chat user.';
+  let status = 'IDLE';
+  if (online && !n.direct_chat_sessions) {
+    title = 'CHAT MODERATION ACTIVE';
+    detail = 'Relayed chat uses message and behavior checks. GATv2 alerts require a matching direct chat flow.';
+    status = 'CHAT ACTIVE';
+  } else if (online && prediction === 'ATTACK') {
+    state = 'attack';
+    title = 'GATv2 FLAGGED A CHAT FLOW';
+    detail = 'The model flagged a captured flow attributed to a connected chat user.';
+    status = 'ANOMALY FLAGGED';
+  } else if (online && (n.capture !== 'running' || n.gatv2 !== 'available')) {
+    title = 'CHAT PACKET ANALYSIS UNAVAILABLE';
+    detail = n.capture_error || n.gatv2_error || 'Waiting for capture and model status.';
+    status = 'CHECK STATUS';
+  } else if (online && !prediction) {
+    title = 'WAITING FOR DIRECT CHAT FLOW ANALYSIS';
+    detail = 'Chat moderation is active. GATv2 reports a result after a matching flow is captured and analyzed.';
+    status = 'CHAT ACTIVE';
+  } else if (online) {
+    state = '';
+    title = 'LATEST CHAT FLOW CLASSIFIED BENIGN';
+    detail = 'Earlier alerts and chat moderation actions appear in the timeline.';
+    status = 'LIVE / MONITORING';
+  }
+  banner.className = 'banner' + (state ? ' ' + state : '');
+  $('bannerIcon').textContent = state === 'attack' ? '⚠' : state ? '◌' : '●';
+  $('bannerTitle').textContent = title;
+  $('bannerCopy').textContent = detail;
+  $('bannerMeta').textContent = 'LAST UPDATE: ' + new Date().toLocaleTimeString();
+  indicator.className = 'live' + (state === 'attack' ? ' warn' : state ? ' wait' : '');
+  indicator.textContent = status;
+}
+function renderTimeline(){
+  const kinds = {
+    gatv2_analysis: 'GATv2 CHAT FLOW ANOMALY',
+    blocked: 'CHAT USER BLOCKED',
+    message_blocked: 'CHAT MESSAGE BLOCKED',
+  };
+  const incidents = events.filter(event =>
+    event.type === 'blocked' || event.type === 'message_blocked' ||
+    (event.type === 'gatv2_analysis' && event.username &&
+      (event.gatv2_prediction === 'ATTACK' || event.prediction === 'ATTACK'))
+  ).reverse();
+  $('threats').textContent = incidents.length + ' EVENTS';
+  $('attackHistory').innerHTML = incidents.slice(0, 60).map(event => {
+    const user = event.username || event.sender || '';
+    const detail = event.type === 'gatv2_analysis'
+      ? (Number(event.anomaly_probability) * 100).toFixed(2) + '% model score'
+      : event.reason || event.threat?.reason || '';
+    return '<div class="timeline-row"><div class="timeline-time">' + esc(timeText(event.timestamp)) +
+      '</div><div class="timeline-dot">▲</div><div><div class="desc">' + kinds[event.type] +
+      '</div><div class="sub">' + esc(user) + (detail ? ' · ' + esc(detail) : '') + '</div></div></div>';
+  }).join('') || '<div class="incident-empty">No chat security events recorded.</div>';
+}
 function renderTerminal(){const recent=events.slice().reverse().slice(0,100);$('events').innerHTML=recent.map(x=>{const bad=(x.type==='gatv2_analysis'&&(x.gatv2_prediction==='ATTACK'||x.prediction==='ATTACK'));const detail=x.reason||x.gatv2_prediction||x.prediction||x.action||x.username||x.source_ip||'';const endpoints=x.source_ip?(x.source_ip+(x.source_port!=null?':'+x.source_port:'')+' → '+(x.destination_ip||'')+(x.destination_port!=null?':'+x.destination_port:'')):'';return '<div class="term-row"><span class="term-time">'+esc(timeText(x.timestamp))+'</span><span class="term-type'+(bad?' attack':'')+'">'+esc(x.type||'EVENT').toUpperCase()+'</span><span class="term-text">'+esc(endpoints||detail)+(endpoints&&detail?' · '+esc(detail):'')+'</span></div>'}).join('');$('eventCount').textContent=events.length+' EVENTS';$('eventCount2').textContent=events.length+' observed'}
-function renderTopology(n){const flows=[...(n.active_flows||[]),...(n.completed_flows||[])].slice(-32),hosts=Array.from(new Set(flows.flatMap(f=>[f.source_ip,f.destination_ip]).filter(Boolean)));$('topologyCount').textContent=hosts.length+' OBSERVED HOSTS';if(!hosts.length){$('topology').innerHTML='<div class="topology-empty">No captured flow endpoints observed yet.</div>';return}const w=640,h=280,cx=w/2,cy=h/2,rad=Math.min(100,Math.max(42,hosts.length*9)),pos={};hosts.forEach((ip,i)=>{const angle=-Math.PI/2+2*Math.PI*i/hosts.length;pos[ip]={x:cx+Math.cos(angle)*rad,y:cy+Math.sin(angle)*rad}});let s='<svg viewBox="0 0 '+w+' '+h+'" role="img" aria-label="Observed network flow endpoints">';flows.forEach(f=>{if(!pos[f.source_ip]||!pos[f.destination_ip])return;const attacked=f.gatv2_prediction==='ATTACK';const col=attacked?'#ff3b4e':'#54e6ff';s+='<line x1="'+pos[f.source_ip].x+'" y1="'+pos[f.source_ip].y+'" x2="'+pos[f.destination_ip].x+'" y2="'+pos[f.destination_ip].y+'" stroke="'+col+'" stroke-width="1" opacity=".52"><title>'+esc(f.source_ip)+' → '+esc(f.destination_ip)+' · '+esc(f.protocol||'')+' · '+esc(f.gatv2_prediction||f.gatv2_status||'pending')+'</title></line>'});hosts.forEach(ip=>{const p=pos[ip];s+='<circle cx="'+p.x+'" cy="'+p.y+'" r="18" fill="#0b150e" stroke="#7cff8a" stroke-width="1"/><text x="'+p.x+'" y="'+(p.y+3)+'" fill="#d7e8d9" text-anchor="middle" font-size="8">HOST '+(hosts.indexOf(ip)+1)+'</text><text x="'+p.x+'" y="'+(p.y+31)+'" fill="#8ba791" text-anchor="middle" font-size="9">'+esc(ip)+'</text>'});s+='</svg>';$('topology').innerHTML=s}
+function renderTopology(n){const flows=[...(n.active_flows||[]),...(n.completed_flows||[])].slice(-32),hosts=Array.from(new Set(flows.flatMap(f=>[f.source_ip,f.destination_ip]).filter(Boolean)));$('topologyCount').textContent=hosts.length+' OBSERVED HOSTS';if(!hosts.length){$('topology').innerHTML='<div class="topology-empty">No captured flow endpoints observed yet.</div>';return}const w=640,h=280,cx=w/2,cy=h/2,rad=Math.min(100,Math.max(42,hosts.length*9)),pos={};hosts.forEach((ip,i)=>{const angle=-Math.PI/2+2*Math.PI*i/hosts.length;pos[ip]={x:cx+Math.cos(angle)*rad,y:cy+Math.sin(angle)*rad}});let s='<svg viewBox="0 0 '+w+' '+h+'" role="img" aria-label="Observed network flow endpoints">';flows.forEach(f=>{if(!pos[f.source_ip]||!pos[f.destination_ip])return;const attacked=f.gatv2_prediction==='ATTACK'&&chatState?.users?.includes(f.username);const col=attacked?'#ff3b4e':'#54e6ff';s+='<line x1="'+pos[f.source_ip].x+'" y1="'+pos[f.source_ip].y+'" x2="'+pos[f.destination_ip].x+'" y2="'+pos[f.destination_ip].y+'" stroke="'+col+'" stroke-width="1" opacity=".52"><title>'+esc(f.source_ip)+' → '+esc(f.destination_ip)+' · '+esc(f.protocol||'')+' · '+esc(f.gatv2_prediction||f.gatv2_status||'pending')+'</title></line>'});hosts.forEach(ip=>{const p=pos[ip];s+='<circle cx="'+p.x+'" cy="'+p.y+'" r="18" fill="#0b150e" stroke="#7cff8a" stroke-width="1"/><text x="'+p.x+'" y="'+(p.y+3)+'" fill="#d7e8d9" text-anchor="middle" font-size="8">HOST '+(hosts.indexOf(ip)+1)+'</text><text x="'+p.x+'" y="'+(p.y+31)+'" fill="#8ba791" text-anchor="middle" font-size="9">'+esc(ip)+'</text>'});s+='</svg>';$('topology').innerHTML=s}
 function renderFlows(n){const flows=[...(n.active_flows||[]),...(n.completed_flows||[])].slice(-100).reverse();$('flowCount').textContent=flows.length+' FLOWS';$('flows').innerHTML=flows.map(f=>{const pred=f.gatv2_prediction||f.gatv2_status||'PENDING',prob=f.gatv2_anomaly_probability;return '<tr><td>'+esc(timeText(f.last_seen||f.timestamp))+'</td><td>'+esc(f.source_ip||'')+':'+esc(f.source_port==null?'':f.source_port)+'</td><td>'+esc(f.destination_ip||'')+':'+esc(f.destination_port==null?'':f.destination_port)+'</td><td>'+esc(f.protocol||'')+'</td><td>'+esc(f.total_packets==null?'—':f.total_packets)+'</td><td>'+esc(f.total_bytes==null?'—':f.total_bytes)+'</td><td class="pill'+(pred==='ATTACK'?' attack':pred==='pending'?' pending':'')+'">'+esc(pred)+'</td><td>'+((prob==null||Number.isNaN(Number(prob)))?'—':(Number(prob)*100).toFixed(2)+'%')+'</td></tr>'}).join('')||'<tr><td colspan="8" class="small">No flows captured yet.</td></tr>'}
-function renderUsers(c){const users=c.behavior||{};$('userRows').innerHTML=Object.entries(users).map(([u,b])=>'<tr><td>'+esc(u)+'</td><td>'+esc(c.client_ips&&c.client_ips[u]||'UNKNOWN')+'</td><td>'+((c.blocked||[]).includes(u)?'<span class="pill attack">BLOCKED</span>':((c.users||[]).includes(u)?'<span class="pill">ONLINE</span>':'OFFLINE'))+'</td><td>'+esc(b.total_messages||0)+'</td><td>'+esc(b.messages_per_second||0)+'</td><td>'+esc(b.risk||'SAFE')+'</td><td>'+esc(c.block_reasons&&c.block_reasons[u]||'—')+'</td><td>'+((c.blocked||[]).includes(u)?'<button type="button" data-unblock="'+esc(u)+'">UNBLOCK</button>':'—')+'</td></tr>').join('')||'<tr><td colspan="8" class="small">No chat users observed.</td></tr>';document.querySelectorAll('[data-unblock]').forEach(btn=>btn.addEventListener('click',()=>unblock(btn.getAttribute('data-unblock'))))}
+let rosterVersion = 0;
+function renderUsers(c) {
+  const blocked = new Set(c.blocked || []);
+  const users = (c.users || []).filter(username => !blocked.has(username));
+  $('users').textContent = users.length;
+  $('blocked').textContent = blocked.size;
+  $('userRows').innerHTML = users.map(username => {
+    const behavior = c.behavior?.[username] || {};
+    return '<tr><td>' + esc(username) + '</td><td>' + esc(c.client_ips?.[username] || 'UNKNOWN') +
+      '</td><td><span class="pill">ONLINE</span></td><td>' + esc(behavior.total_messages || 0) +
+      '</td><td>' + esc(behavior.messages_per_second || 0) + '</td><td>' + esc(behavior.risk || 'SAFE') + '</td></tr>';
+  }).join('') || '<tr><td colspan="6" class="small">No chat users online.</td></tr>';
+  $('blockedUsers').hidden = blocked.size === 0;
+  $('blockedUserRows').innerHTML = Array.from(blocked, username =>
+    '<tr><td>' + esc(username) + '</td><td>' + esc(c.blocked_client_ips?.[username] || '—') +
+    '</td><td>' + esc(c.block_reasons?.[username] || '—') +
+    '</td><td><button type="button" data-unblock="' + esc(username) + '">UNBLOCK</button></td></tr>'
+  ).join('');
+}
 function addSample(n){const t=Date.now()/1000,v=Number(n.packets_per_second||0);if(!samples.length||t-samples[samples.length-1].t>=1.8)samples.push({t:t,v:v});samples=samples.filter(p=>p.t>=t-60).slice(-sampleLimit);drawGraph()}
-async function unblock(user){const r=await fetch('/api/admin/unblock/'+encodeURIComponent(user),{method:'POST',headers:{'X-Admin-Token':$('adminToken').value}});if(!r.ok){const body=await r.json().catch(()=>({}));alert(body.detail||'Unblock failed');return}await refresh()}
-async function refresh(){if(window.SentinelAuth&&!window.SentinelAuth.canView)return;if(dashboardRefreshBusy)return;dashboardRefreshBusy=true;try{const rs=await Promise.all([fetch('/api/chat/state',{cache:'no-store'}),fetch('/api/network/state',{cache:'no-store'}),fetch('/api/tunnel/state',{cache:'no-store'}).catch(()=>({ok:false}))]);if(!rs[0].ok||!rs[1].ok)throw new Error('API returned '+rs[0].status+' / '+rs[1].status);const c=await rs[0].json(),n=await rs[1].json();let t=null;if(rs[2]&&rs[2].ok)try{t=await rs[2].json()}catch(_){}chatState=c;networkState=n;mergeEvents(c.events||[]);$('pps').textContent=formatRate(n.packets_per_second);$('bps').textContent=formatBytes(n.bytes_per_second);$('active').textContent=(n.active_flows||[]).length;$('analyses').textContent=n.gatv2_analyses==null?'—':n.gatv2_analyses;$('anomalies').textContent=n.gatv2_anomalies==null?'—':n.gatv2_anomalies;$('users').textContent=(c.users||[]).length;$('blocked').textContent=(c.blocked||[]).length;$('mps').textContent=formatRate(c.messages_per_second);$('newFlows').textContent=events.filter(x=>x.type==='flow_started'&&Date.now()/1000-(x.timestamp||0)<=60).length;$('captureStatus').textContent='Capture: '+(n.capture||'unknown')+' · GATv2: '+(n.gatv2||'unknown')+' · Pending inference flows: '+(n.pending_flows||0)+(n.capture_error?' · '+n.capture_error:'')+(n.gatv2_error?' · '+n.gatv2_error:'');if(t){$('tunnelStatusTag').textContent='TUNNEL '+(t.status||'DISABLED').toUpperCase();$('tunnelStatusTag').className='tag '+(t.status==='running'?'ok':t.status==='error'?'bad':'');$('activeJoiningUrl').textContent=t.active_joining_url||'—';$('joiningModeLabel').textContent=t.joining_mode==='public_https'?'PUBLIC HTTPS':'LOCAL WI-FI';$('publicTunnelUrl').textContent=t.public_url||(t.public_hostname?('CONFIGURED ('+t.public_hostname+' - WAITING)'):'DISABLED / NOT CONFIGURED');$('localLanUrl').textContent=t.local_url||'—';$('tunnelDetailNote').textContent=t.error?t.error:(t.status==='running'?'Named tunnel connected to Cloudflare Edge. Public access active.':'Local LAN access active. Phone and laptop attendees on same Wi-Fi can join.')}$('interfaceInfo').textContent='CAPTURE: '+(n.adapter_name?(n.adapter_name+' ['+(n.adapter_type||'NET')+'] '+(n.local_ip?'('+n.local_ip+') ':'')+'['+(n.selection_mode||'auto')+']'):(n.interface||'NOT SELECTED'))+(t&&t.joining_mode==='public_https'?' · PUBLIC: HTTPS (CLOUDFLARE)':' · LOCAL: LAN ONLY');$('updatedAt').textContent='UPDATED: '+new Date().toLocaleTimeString();renderBanner(n);renderIncident(n);renderTimeline();renderTerminal();renderTopology(n);renderFlows(n);renderUsers(c);addSample(n)}catch(e){$('captureStatus').textContent='API UNAVAILABLE: '+e.message;$('liveIndicator').className='live wait';$('liveIndicator').textContent='API ERROR';$('warningBanner').className='banner wait';$('bannerTitle').textContent='LIVE STATE UNAVAILABLE';$('bannerCopy').textContent='Network and security state could not be refreshed.'}finally{dashboardRefreshBusy=false}}
+async function unblock(user) {
+  if (!window.SentinelAuth?.authenticated) {
+    $('hf-token').focus();
+    alert('Authenticate with your administrator token before unblocking a user.');
+    return;
+  }
+  try {
+    const response = await window.SentinelAuth.fetch('/api/admin/unblock/' + encodeURIComponent(user), {method: 'POST'});
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(body.detail || 'Unblock failed');
+    }
+    await refresh();
+  } catch (error) {
+    alert(error.message);
+  }
+}
+async function refresh(){if(window.SentinelAuth&&!window.SentinelAuth.canView)return;if(dashboardRefreshBusy)return;dashboardRefreshBusy=true;const rosterAtStart=rosterVersion;try{const rs=await Promise.all([fetch('/api/chat/state',{cache:'no-store'}),fetch('/api/network/state',{cache:'no-store'}),fetch('/api/tunnel/state',{cache:'no-store'}).catch(()=>({ok:false}))]);if(!rs[0].ok||!rs[1].ok)throw new Error('API returned '+rs[0].status+' / '+rs[1].status);const c=await rs[0].json(),n=await rs[1].json();let t=null;if(rs[2]&&rs[2].ok)try{t=await rs[2].json()}catch(_){}if(window.SentinelAuth&&!window.SentinelAuth.canView)return;chatState=rosterAtStart===rosterVersion?c:{...chatState,behavior:c.behavior};networkState=n;mergeEvents(c.events||[]);$('pps').textContent=formatRate(n.packets_per_second);$('bps').textContent=formatBytes(n.bytes_per_second);$('active').textContent=(n.active_flows||[]).length;$('analyses').textContent=n.gatv2_analyses==null?'—':n.gatv2_analyses;$('anomalies').textContent=n.gatv2_anomalies==null?'—':n.gatv2_anomalies;$('mps').textContent=formatRate(c.messages_per_second);$('newFlows').textContent=events.filter(x=>x.type==='flow_started'&&Date.now()/1000-(x.timestamp||0)<=60).length;$('captureStatus').textContent='Capture: '+(n.capture||'unknown')+' · GATv2: '+(n.gatv2||'unknown')+' · Pending inference flows: '+(n.pending_flows||0)+(n.capture_error?' · '+n.capture_error:'')+(n.gatv2_error?' · '+n.gatv2_error:'');if(t){$('tunnelStatusTag').textContent='TUNNEL '+(t.status||'DISABLED').toUpperCase();$('tunnelStatusTag').className='tag '+(t.status==='running'?'ok':t.status==='error'?'bad':'');$('activeJoiningUrl').textContent=t.active_joining_url||'—';$('joiningModeLabel').textContent=t.joining_mode==='public_https'?'PUBLIC HTTPS':'LOCAL WI-FI';$('publicTunnelUrl').textContent=t.public_url||(t.public_hostname?('CONFIGURED ('+t.public_hostname+' - WAITING)'):'DISABLED / NOT CONFIGURED');$('localLanUrl').textContent=t.local_url||'—';$('tunnelDetailNote').textContent=t.error?t.error:(t.status==='running'?'Cloudflare tunnel connected. Public access active.':'Local LAN access active. Phone and laptop attendees on same Wi-Fi can join.')}$('interfaceInfo').textContent='CAPTURE: '+(n.adapter_name?(n.adapter_name+' ['+(n.adapter_type||'NET')+'] '+(n.local_ip?'('+n.local_ip+') ':'')+'['+(n.selection_mode||'auto')+']'):(n.interface||'NOT SELECTED'))+(t&&t.joining_mode==='public_https'?' · PUBLIC: HTTPS (CLOUDFLARE)':' · LOCAL: LAN ONLY');$('updatedAt').textContent='UPDATED: '+new Date().toLocaleTimeString();renderBanner(n);renderIncident(n);renderTimeline();renderTerminal();renderTopology(n);renderFlows(n);renderUsers(chatState);addSample(n)}catch(e){$('captureStatus').textContent='API UNAVAILABLE: '+e.message;$('liveIndicator').className='live wait';$('liveIndicator').textContent='API ERROR';$('warningBanner').className='banner wait';$('bannerTitle').textContent='LIVE STATE UNAVAILABLE';$('bannerCopy').textContent='Network and security state could not be refreshed.'}finally{dashboardRefreshBusy=false}}
 let dashboardRetries=0,dashboardTimer=null,dashboardDisposed=false;
 function connectDashboard(){
  if(dashboardDisposed||(window.SentinelAuth&&!window.SentinelAuth.canView)||(socket&&socket.readyState<=1))return;
  socket=new WebSocket((location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/ws/dashboard');
  socket.onopen=()=>{dashboardRetries=0;refresh();};
- socket.onmessage=e=>{try{const x=JSON.parse(e.data);if(x.type==='HTTP_FLOOD_TELEMETRY')return;if(x.type==='snapshot'){mergeEvents(x.events||[]);if(chatState)renderTerminal();return}if(x.type==='users'){if(chatState){chatState.users=x.users||[];chatState.blocked=x.blocked||[];renderUsers(chatState)}return}mergeEvents([x]);renderTerminal();renderTimeline();if(x.type==='gatv2_analysis'||x.type==='flow_started'||x.type==='flow_completed')refresh()}catch(_){}};
+ socket.onmessage = event => {
+  if (window.SentinelAuth && !window.SentinelAuth.canView) return;
+  try {
+   const update = JSON.parse(event.data);
+   if (update.type === 'HTTP_FLOOD_TELEMETRY') return;
+   if (update.type === 'snapshot' || update.type === 'users') {
+    rosterVersion++;
+    chatState = {...chatState, ...update};
+    renderUsers(chatState);
+    if (networkState) {
+     renderBanner(networkState);
+     renderIncident(networkState);
+    }
+    if (update.type === 'snapshot') {
+     mergeEvents(update.events);
+     renderTerminal();
+    }
+    return;
+   }
+   mergeEvents([update]);
+   renderTerminal();
+   renderTimeline();
+   if (['gatv2_analysis', 'flow_started', 'flow_completed'].includes(update.type)) refresh();
+  } catch (_) {}
+ };
  socket.onclose=()=>{
   $('liveIndicator').className='live wait';$('liveIndicator').textContent='EVENT STREAM OFFLINE';
   if(dashboardDisposed||(window.SentinelAuth&&!window.SentinelAuth.canView)||dashboardRetries>=6)return;
@@ -374,11 +544,15 @@ function connectDashboard(){
  };
  socket.onerror=()=>{$('liveIndicator').textContent='STREAM ERROR / RETRYING';};
 }
+$('blockedUserRows').addEventListener('click', event => {
+  const button = event.target.closest('[data-unblock]');
+  if (button) unblock(button.dataset.unblock);
+});
 $('refreshButton').addEventListener('click',()=>{dashboardRetries=0;connectDashboard();refresh();});
 window.addEventListener('sentinel-auth-changed',()=>{
  clearTimeout(dashboardTimer);dashboardRetries=0;
  if(window.SentinelAuth.canView){connectDashboard();refresh();}
- else {if(socket)socket.close();events=[];networkState=null;chatState=null;}
+ else {if(socket)socket.close();events=[];networkState=null;chatState=null;rosterVersion++;renderUsers({});}
 });
 if(window.SentinelAuth)window.SentinelAuth.ready.then(()=>{connectDashboard();refresh();});
 else {connectDashboard();refresh();}
@@ -1776,9 +1950,7 @@ async def chat_state() -> dict:
                                        "messages_per_second": 0.0, "messages_per_minute": 0,
                                        "unique_recipients": 0, "risk": "SAFE"})
     now = time.time()
-    return {"users": sorted(state.clients), "blocked": sorted(state.blocked), "block_reasons": state.block_reasons,
-            "client_ips": dict(state.client_ips),
-            "behavior": behavior, "messages": len(state.recent),
+    return {**state.dashboard_roster(), "behavior": behavior, "messages": len(state.recent),
             "messages_per_second": sum(now - item.get("timestamp", 0) <= 1 for item in state.recent),
             "messages_last_30_seconds": sum(now - item.get("timestamp", 0) <= 30 for item in state.recent),
             "events": list(state.events)}
@@ -1815,8 +1987,8 @@ async def dashboard_socket(ws: WebSocket) -> None:
         return
     await ws.accept()
     dashboard_clients.add(ws)
-    await ws.send_json({"type": "snapshot", "users": sorted(state.clients), "blocked": sorted(state.blocked), "events": list(state.events), "block_reasons": state.block_reasons})
     try:
+        await ws.send_json({"type": "snapshot", **state.dashboard_roster(), "events": list(state.events)})
         while demo_security.can_view(ws):
             try:
                 await asyncio.wait_for(ws.receive_text(), timeout=10)
@@ -1831,18 +2003,19 @@ async def dashboard_socket(ws: WebSocket) -> None:
 
 
 @router.post("/api/admin/unblock/{user_id}")
-async def unblock_user(user_id: str, x_admin_token: str | None = Header(default=None)) -> dict:
-    token = os.getenv("ADMIN_TOKEN")
-    if not token or x_admin_token != token:
-        raise HTTPException(status_code=403, detail="Admin token is missing or invalid; configure ADMIN_TOKEN.")
-    if user_id not in state.blocked:
+async def unblock_user(user_id: str, request: Request) -> dict:
+    demo_security.require_control(request, dashboard=True)
+    username = state.blocked_username(user_id)
+    if username is None:
         raise HTTPException(status_code=404, detail="User is not blocked.")
-    state.blocked.remove(user_id)
-    reason = state.block_reasons.pop(user_id, "")
-    behavior_analyzer.reset(user_id)
-    await state.event("admin_unblocked", {"username": user_id, "previous_reason": reason, "detection_source": "ADMIN"})
+    state.blocked.remove(username)
+    reason = state.block_reasons.pop(username, "")
+    behavior_analyzer.reset(username)
+    blocking_manager.unblock_user(username)
+    threat_engine.user_cumulative_risk.pop(username.casefold(), None)
+    await state.event("admin_unblocked", {"username": username, "previous_reason": reason, "detection_source": "ADMIN"})
     await state.roster()
-    return {"status": "unblocked", "username": user_id}
+    return {"status": "unblocked", "username": username}
 
 
 @router.websocket("/ws/chat/{username}")
@@ -1854,31 +2027,48 @@ async def chat_socket(ws: WebSocket, username: str) -> None:
         await ws.close(code=1008)
         return
     username = username.strip()
-    if username in state.blocked:
-        await ws.accept()
-        await ws.send_json({"type": "blocked", "message": "Your account has been temporarily blocked due to suspicious activity."})
-        await ws.close(code=1008)
-        return
-    if not re.fullmatch(r"[A-Za-z0-9_-]{2,24}", username) or username in state.clients:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{2,24}", username):
         await ws.accept()
         await ws.send_json({"type": "blocked", "message": "Username is invalid, already connected, or blocked."})
         await ws.close(code=1008)
         return
-    await ws.accept()
+    connection = boundary(ws)
+    if request_host and f"https://{request_host.casefold().removesuffix(':443')}" == public_origin() and not connection.tunnel:
+        await ws.close(code=1008)
+        return
     peer_host = ws.client.host if ws.client else None
-    client_ip = resolve_client_ip(peer_host, ws.headers)
+    client_ip = connection.source if connection.tunnel else resolve_client_ip(peer_host, ws.headers)
     client_port = int(ws.client.port) if ws.client else 0
-    server = ws.scope.get("server") or (None, int(os.getenv("PORT", "8000")))
-    server_port = int(server[1]) if len(server) > 1 and server[1] else int(os.getenv("PORT", "8000"))
+    server_ip, server_port = ws.scope.get("server") or (None, 0)
+    # A tunnel's forwarded visitor address is not the peer of this TCP connection.
+    direct_endpoint = (client_ip, client_port, server_ip, server_port, uuid.uuid4().hex) if (
+        peer_host == client_ip and server_ip and server_port and client_port and not connection.tunnel
+    ) else None
+    username_key = username.casefold()
+    await ws.accept()
     async with state.lock:
-        state.clients[username] = ws
-        state.client_ips[username] = client_ip
-        state.client_endpoints[username] = (client_ip, client_port, server_port)
-    await state.roster()
-    await state.event("user_joined", {"username": username, "source_ip": client_ip})
+        rejected = state.chat_block_message(username, client_ip)
+        if not rejected and any(name.casefold() == username_key for name in state.clients):
+            rejected = "Username is already connected."
+        if not rejected:
+            state.clients[username] = ws
+            state.client_ips[username] = client_ip
+            if direct_endpoint:
+                state.client_endpoints[username] = direct_endpoint
+    if rejected:
+        await ws.send_json({"type": "blocked", "message": rejected})
+        await ws.close(code=1008)
+        return
     try:
+        await state.roster()
+        await state.event("user_joined", {"username": username, "source_ip": client_ip})
         while True:
             raw = await ws.receive_json()
+            block_message = state.chat_block_message(username, client_ip)
+            if block_message:
+                await ws.send_json({"type": "blocked", "message": block_message})
+                await ws.close(code=1008)
+                break
             recipient = str(raw.get("recipient", "")).strip()
             text = str(raw.get("text", ""))
             if len(text) > MAX_MESSAGE_LENGTH:
@@ -1886,9 +2076,6 @@ async def chat_socket(ws: WebSocket, username: str) -> None:
                 continue
             if not text.strip() or not recipient:
                 continue
-            if username in state.blocked:
-                await ws.send_json({"type": "blocked", "message": "Your account is blocked."})
-                break
             behavior, behavior_details = behavior_risk(username, recipient, text)
             message_id = uuid.uuid4().hex
             message_analysis = message_analyzer.analyze(text)
@@ -1949,10 +2136,15 @@ async def chat_socket(ws: WebSocket, username: str) -> None:
             if decision["action"] == "BLOCK_USER":
                 state.blocked.add(username)
                 state.block_reasons[username] = decision["reason"]
-                await ws.send_json({"type": "blocked", "message": "Your account has been temporarily blocked due to suspicious activity."})
+                await ws.send_json({"type": "blocked", "message": state.chat_block_message(username, client_ip)})
                 await state.event("blocked", {"username": username, "source_ip": client_ip,
                                                "reason": decision["reason"], "threat": decision})
                 await state.roster()
+                await ws.close(code=1008)
+                break
+            block_message = state.chat_block_message(username, client_ip)
+            if block_message:
+                await ws.send_json({"type": "blocked", "message": block_message})
                 await ws.close(code=1008)
                 break
             if decision["action"] == "BLOCK_MESSAGE":
@@ -1960,7 +2152,7 @@ async def chat_socket(ws: WebSocket, username: str) -> None:
                 await state.event("message_blocked", {**record, "reason": decision["reason"]})
                 continue
             peer = state.clients.get(recipient)
-            if not peer:
+            if not peer or state.chat_block_message(recipient, state.client_ips.get(recipient)):
                 await ws.send_json({"type": "warning", "message": "Recipient is not connected."})
                 continue
             delivered = {"type": "message", **record, "timestamp": time.time()}

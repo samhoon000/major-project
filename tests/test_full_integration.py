@@ -20,6 +20,7 @@ from fastapi.testclient import TestClient
 
 from app import app
 from backend.chat_service import state, threat_engine, behavior_analyzer
+from backend.security.blocking import BlockingManager
 
 
 class TestFullApplicationIntegration(unittest.TestCase):
@@ -33,6 +34,9 @@ class TestFullApplicationIntegration(unittest.TestCase):
 
     def setUp(self):
         # Reset transient state between integration runs
+        manager = BlockingManager()
+        self.enterContext(patch("backend.chat_service.blocking_manager", manager))
+        self.enterContext(patch("backend.security.threat_engine.blocking_manager", manager))
         state.clients.clear()
         state.client_ips.clear()
         state.client_endpoints.clear()

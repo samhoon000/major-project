@@ -30,6 +30,10 @@ def remote_enabled():
     return os.getenv("HTTP_FLOOD_REMOTE_ENABLED", "false").lower() in ("1", "true", "yes")
 
 
+def dashboard_remote_enabled():
+    return remote_enabled() or os.getenv("DASHBOARD_REMOTE_ENABLED", "false").lower() in ("1", "true", "yes")
+
+
 def public_origin():
     raw = os.getenv("CLOUDFLARE_PUBLIC_HOSTNAME", "").strip()
     # Quick hosts are learned from our existing cloudflared manager, never
@@ -155,7 +159,7 @@ class DemoSecurity:
                 self.sessions.pop(key, None)
                 return None
             context = boundary(connection)
-            if not context.local and not (context.tunnel and remote_enabled() and record["remote"]):
+            if not context.local and not (context.tunnel and dashboard_remote_enabled() and record["remote"]):
                 return None
             return record
 
@@ -167,9 +171,10 @@ class DemoSecurity:
         if not origin or _origin(origin) != context.origin:
             raise HTTPException(403, "Same-origin request required")
 
-    def require_control(self, connection, local_only=False):
+    def require_control(self, connection, local_only=False, *, dashboard=False):
         context = boundary(connection)
-        if not context.local and not (not local_only and context.tunnel and remote_enabled()):
+        allow_remote = dashboard_remote_enabled() if dashboard else remote_enabled()
+        if not context.local and not (not local_only and context.tunnel and allow_remote):
             raise HTTPException(403, "Use localhost or the explicitly enabled HTTPS tunnel")
         self.check_origin(connection, required=not context.local)
         header = connection.headers.get("x-admin-token")
@@ -195,7 +200,7 @@ class DemoSecurity:
             address = _ip(name)
             return bool(normalized and normalized.startswith(("http://","https://")) and
                         (name == "localhost" or address and address.is_loopback))
-        if not (context.tunnel and remote_enabled()):
+        if not (context.tunnel and dashboard_remote_enabled()):
             return False
         origin = connection.headers.get("origin")
         if connection.scope["type"] == "websocket" and not origin:
@@ -206,7 +211,7 @@ class DemoSecurity:
 
     def login(self, connection, token):
         context = boundary(connection)
-        if not context.local and not (context.tunnel and remote_enabled()):
+        if not context.local and not (context.tunnel and dashboard_remote_enabled()):
             raise HTTPException(403, "Remote administration is not enabled for this HTTPS tunnel")
         self.check_origin(connection, required=True)
         self.check_token(connection, token)
@@ -253,7 +258,7 @@ async def login(request: Request):
 async def session_state(request: Request):
     record = demo_security.session(request)
     response = JSONResponse(dict(authenticated=bool(record), local=boundary(request).local,
-        remote_enabled=remote_enabled(), expires_in=max(0,int(record["expires"]-demo_security.clock())) if record else 0),
+        remote_enabled=dashboard_remote_enabled(), expires_in=max(0,int(record["expires"]-demo_security.clock())) if record else 0),
         headers={"Cache-Control":"no-store"})
     if record:
         response.headers["X-CSRF-Token"] = record["csrf"]
@@ -262,7 +267,7 @@ async def session_state(request: Request):
 
 @router.post("/api/auth/logout")
 async def logout(request: Request):
-    demo_security.require_control(request)
+    demo_security.require_control(request, dashboard=True)
     value = request.cookies.get(COOKIE, "")
     with demo_security.lock:
         demo_security.sessions.pop(hashlib.sha256(value.encode()).hexdigest(),None)
@@ -285,6 +290,9 @@ class DemoExposure:
     READ = {"/api/chat/state", "/api/network/state", "/api/attack-lab/status",
             "/api/attack-lab/http-flood/state", "/api/tunnel/state", "/api/tunnel/qr.svg"}
     CONTROL = {"/api/attack-lab/http-flood/"+x for x in ("start","stop","reset","unblock","monitor","authorize")}
+    CHAT_AND_DASHBOARD = {"/", "/chat", "/dashboard", "/api/auth/login", "/api/auth/session",
+                          "/api/auth/logout", "/api/auth/ui.js", "/api/chat/state", "/api/network/state",
+                          "/api/tunnel/state", "/api/tunnel/qr.svg"}
 
     def __init__(self, app):
         self.app = app
@@ -305,9 +313,15 @@ class DemoExposure:
         if boundary(connection).local:
             await self.app(scope,receive,send)
             return
+        if path.startswith("/api/admin/unblock/") and scope["method"] == "POST":
+            await self.app(scope, receive, send)
+            return
         response = None
-        if path == "/":
-            response = RedirectResponse("/attack-lab",status_code=307)
+        dashboard_only = dashboard_remote_enabled() and not remote_enabled()
+        if dashboard_only and path not in self.CHAT_AND_DASHBOARD:
+            response = JSONResponse({"detail": "Not found"}, status_code=404)
+        elif path == "/":
+            response = RedirectResponse("/chat" if dashboard_only else "/attack-lab", status_code=307)
         elif path in ("/api/tunnel/state", "/api/tunnel/qr.svg") and not demo_security.can_view(connection):
             # Public chat joining metadata contains no LAN IP, runtime state or logs.
             origin = public_origin()

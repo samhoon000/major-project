@@ -1,9 +1,11 @@
 import os
 import subprocess
+import time
 import unittest
 from unittest.mock import patch, MagicMock, AsyncMock
 from fastapi.testclient import TestClient
 
+from backend.chat_service import ChatState
 from backend.network.enforcement import QuarantineManager, WindowsFirewall, protected_server_ips, get_default_gateways
 from backend.network.runtime import NetworkRuntime
 from app import app
@@ -245,9 +247,76 @@ class ApiQuarantineTests(unittest.TestCase):
                 mock_unblock.assert_called_once_with(mock_block.rule_name)
 
 
+class NetworkRuntimeChatScopeTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.chat = ChatState()
+        self.enterContext(patch("backend.network.runtime.chat_state", self.chat))
+        self.runtime = NetworkRuntime()
+        self.packet = {"source_ip": "192.0.2.10", "destination_ip": "192.0.2.20",
+                       "source_port": 49152, "destination_port": 8001, "protocol": "TCP",
+                       "packet_length": 120, "timestamp": time.time()}
+
+    def test_background_traffic_stays_visible_without_a_chat_identity(self):
+        self.runtime._packet(self.packet)
+        self.chat.clients["relayed"] = MagicMock()
+        self.runtime._packet(self.packet)
+        self.assertEqual(self.runtime.status()["packets"], 2)
+        self.assertNotIn("username", self.runtime.status()["active_flows"][0])
+        self.chat.client_endpoints["direct"] = ("192.0.2.10", 49152, "192.0.2.20", 8001, "session-a")
+        self.runtime._packet({**self.packet, "destination_ip": "192.0.2.30"})
+        self.runtime._packet({**self.packet, "protocol": "UDP"})
+        self.runtime._packet(self.packet)
+        self.runtime._packet({**self.packet, "source_ip": "192.0.2.20", "destination_ip": "192.0.2.10",
+                              "source_port": 8001, "destination_port": 49152})
+        status = self.runtime.status()
+        self.assertEqual(status["packets"], 6)
+        self.assertEqual(len(status["active_flows"]), 4)
+        attributed = [flow for flow in status["active_flows"] if flow.get("username") == "direct"]
+        self.assertEqual(len(attributed), 1)
+        self.assertEqual(attributed[0]["total_packets"], 2)
+
+    async def test_unattributed_prediction_does_not_create_an_attack_alert(self):
+        self.runtime._packet(self.packet)
+        self.runtime.tracker.expire(force=True)
+        flow = self.runtime._take_pending()[0]
+        with patch("backend.network.runtime.gatv2_engine._is_loaded", True), \
+             patch("backend.network.runtime.gatv2_engine.predict_flows", return_value=[{"is_anomaly": True}]), \
+             patch.object(self.runtime.quarantine_manager, "handle_attack") as quarantine:
+            await self.runtime._analyze([flow])
+        status = self.runtime.status()
+        self.assertEqual(status["gatv2_analyses"], 1)
+        self.assertEqual(status["gatv2_anomalies"], 0)
+        self.assertEqual(status["completed_flows"][0]["gatv2_status"], "observed")
+        self.assertIsNone(flow["gatv2_prediction"])
+        quarantine.assert_not_called()
+        self.assertFalse(self.chat.events)
+
+    async def test_reused_endpoints_do_not_publish_results_from_a_disconnected_session(self):
+        endpoint = ("192.0.2.10", 49152, "192.0.2.20", 8001)
+        self.chat.client_endpoints["direct"] = (*endpoint, "session-a")
+        self.runtime._packet(self.packet)
+        self.runtime.tracker.expire(force=True)
+        first = self.runtime._take_pending()[0]
+
+        def disconnect_during_inference(_inputs):
+            self.chat.client_endpoints["direct"] = (*endpoint, "session-b")
+            return [{"is_anomaly": True}]
+
+        with patch("backend.network.runtime.gatv2_engine._is_loaded", True), \
+             patch("backend.network.runtime.gatv2_engine.predict_flows", side_effect=disconnect_during_inference):
+            await self.runtime._analyze([first])
+        self.assertEqual(first["gatv2_status"], "ended")
+        self.assertEqual(self.runtime.status()["gatv2_anomalies"], 0)
+        self.assertIsNone(self.runtime.status()["latest_analysis"])
+        self.assertFalse(self.chat.events)
+
+
 class NetworkRuntimeAnalyzeIntegrationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.runtime = NetworkRuntime()
+        chat = ChatState()
+        chat.client_endpoints["remote_client"] = ("198.51.100.22", 49152, "192.168.1.50", 8000, "session-a")
+        self.enterContext(patch("backend.network.runtime.chat_state", chat))
         self.runtime.quarantine_manager.protected_ips = {"127.0.0.1", "::1", "192.168.1.1", "192.168.1.50"}
         self.runtime.quarantine_manager.admin_ips = {"10.0.0.99"}
         self.runtime.quarantine_manager.platform_name = "Windows"
@@ -263,6 +332,7 @@ class NetworkRuntimeAnalyzeIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "total_bytes": 2400,
             "duration": 1.2,
             "username": "remote_client",
+            "chat_session_id": "session-a",
             "features": {
                 "Flow Duration": 1200000.0,
                 "Total Fwd Packets": 10,
