@@ -25,6 +25,7 @@ class Flow:
     packet_lengths: list[int] = field(default_factory=list)
     inter_arrival_times: list[float] = field(default_factory=list)
     tcp_flags: dict[str, int] = field(default_factory=dict)
+    chat_session: tuple[str, str] | None = None
 
     def snapshot(self) -> dict:
         duration = max(0.0, self.last_seen - self.start_time)
@@ -38,7 +39,9 @@ class Flow:
                 "total_bytes": octets, "packet_lengths": list(self.packet_lengths),
                 "inter_arrival_times": list(self.inter_arrival_times), "tcp_flags": dict(self.tcp_flags),
                 "packets_per_second": packets / duration if duration else float(packets),
-                "bytes_per_second": octets / duration if duration else float(octets)}
+                "bytes_per_second": octets / duration if duration else float(octets),
+                **({"username": self.chat_session[0], "chat_session_id": self.chat_session[1]}
+                   if self.chat_session else {})}
 
 
 class FlowTracker:
@@ -56,15 +59,19 @@ class FlowTracker:
         return (*sorted((a, b)), protocol.upper())
 
     def add_packet(self, src: str, dst: str, sport: int, dport: int, protocol: str, length: int,
-                   timestamp: float | None = None, tcp_flags: str | None = None) -> dict:
+                   timestamp: float | None = None, tcp_flags: str | None = None,
+                   *, chat_session: tuple[str, str] | None = None) -> dict:
         now = self.clock() if timestamp is None else timestamp
         with self._lock:
             self.expire(now)
             protocol = protocol.upper()
             key = self.key(src, dst, sport, dport, protocol)
+            if chat_session:
+                key = (*key, chat_session)
             flow = self.active.get(key)
             if flow is None:
-                flow = Flow(uuid.uuid4().hex, src, dst, int(sport), int(dport), protocol, now, now)
+                flow = Flow(uuid.uuid4().hex, src, dst, int(sport), int(dport), protocol, now, now,
+                            chat_session=chat_session)
                 self.active[key] = flow
             if (src, int(sport), dst, int(dport)) == (flow.source_ip, flow.source_port, flow.destination_ip, flow.destination_port):
                 flow.forward_packet_count += 1

@@ -12,9 +12,9 @@
     document.body.classList.toggle('sentinel-locked',!state.canView);
     $('sentinel-logout').disabled=!authenticated;
     $('sentinel-auth-status').textContent=authenticated ? 'Authenticated · expires at '+new Date(Date.now()+data.expires_in*1000).toLocaleTimeString() :
-      local ? 'Local viewing active. Authenticate or enter the token before using controls.' :
-      data.remote_enabled ? 'Authentication required to view telemetry and control the local demonstration.' :
-      'Remote control is disabled. Configure the public hostname and HTTP_FLOOD_REMOTE_ENABLED on the host.';
+      local ? 'Local viewing active. Authenticate before using administrator controls.' :
+      data.remote_enabled ? 'Authenticate to view telemetry or use administrator controls.' :
+      'Remote administration is disabled on the host.';
     window.dispatchEvent(new CustomEvent('sentinel-auth-changed',{detail:{authenticated,local,canView:state.canView}}));
   }
   async function apiFetch(url,options={}) {
