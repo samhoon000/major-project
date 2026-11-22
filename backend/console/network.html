@@ -2,12 +2,21 @@
   <div><h1>Network Analysis</h1><p>Observed network flows and GATv2 classifications</p></div>
   <span id="network-connection" class="console-status" role="status">Checking capture</span>
 </header>
+<section class="console-card" aria-labelledby="inference-path">
+  <h2 id="inference-path">GATv2 inference pipeline</h2>
+  <ol id="network-pipeline" class="console-pipeline">
+    <li>Captured packets<span>Checking</span></li><li>Flow features<span>Checking</span></li>
+    <li>Graph construction<span>Checking</span></li><li>GATv2 inference<span>Checking</span></li>
+    <li>Classification<span>Checking</span></li>
+  </ol>
+</section>
 <dl id="network-metrics" class="console-metrics"></dl>
 <div class="console-grid">
   <section class="console-card">
     <h2>Live network activity</h2>
-    <p class="console-caption">Packets per second · last minute</p>
-    <svg id="network-chart" class="console-chart" viewBox="0 0 900 215" role="img" aria-label="Packets per second over the last minute"></svg>
+    <p class="console-caption">Capture samples · last minute</p>
+    <div class="console-key"><span style="--series:#62d9ce">Packets/s</span><span style="--series:#9aafff">KiB/s</span></div>
+    <svg id="network-chart" class="console-chart" viewBox="0 0 900 215" role="img" aria-label="Packets and kibibytes per second over the last minute"></svg>
     <p id="network-chart-status" class="console-caption"></p>
   </section>
   <section class="console-card">
@@ -27,10 +36,10 @@
   <ul id="network-anomalies" class="console-list"></ul>
 </section>
 <details class="console-card">
-  <summary>Advanced Details</summary>
+  <summary>Recent captured flows</summary>
   <p>Up to 25 captured flows from the current runtime.</p>
   <div class="console-table">
-    <table><thead><tr><th>Source</th><th>Destination</th><th>Protocol</th><th>Packets</th><th>GATv2</th></tr></thead>
+    <table><thead><tr><th>Source</th><th>Destination</th><th>Protocol</th><th>Packets</th><th>Bytes</th><th>Duration</th><th>GATv2</th></tr></thead>
     <tbody id="network-flows"></tbody></table>
   </div>
 </details>

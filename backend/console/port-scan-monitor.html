@@ -1,0 +1,29 @@
+<section id="port-scan-monitor" class="console-card" aria-labelledby="port-scan-heading">
+  <div class="console-section-head">
+    <h2 id="port-scan-heading">Port Scan Detection</h2>
+    <span id="port-scan-capture" class="console-status">Checking capture</span>
+  </div>
+  <p class="console-caption">Source · TCP packet capture. Failures require an observed TCP refusal.</p>
+  <dl id="port-scan-metrics" class="console-metrics"></dl>
+  <h3>Port Scan Activity</h3>
+  <p id="port-scan-chart-note" class="console-caption"></p>
+  <div class="console-key">
+    <span style="--series:#71ceff">Connection attempts</span>
+    <span style="--series:#7df1ad">Unique destination ports</span>
+    <span style="--series:#ff857b">Failed connections</span>
+    <span style="--series:#ffc37a">Detection marker</span>
+  </div>
+  <svg id="port-scan-chart" class="console-chart" viewBox="0 0 900 215" role="img"
+       aria-label="Recent TCP connection attempts, distinct ports, TCP refusals and port scan detections"></svg>
+  <div class="console-grid">
+    <div>
+      <h3>Source and enforcement</h3>
+      <dl id="port-scan-evidence" class="console-facts"></dl>
+      <a class="console-link" href="/attack-lab#port-scan-lab">Open Port Scan Detection Lab</a>
+    </div>
+    <div>
+      <h3>Recent events</h3>
+      <ol id="port-scan-events" class="console-list"></ol>
+    </div>
+  </div>
+</section>

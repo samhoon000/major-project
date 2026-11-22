@@ -25,7 +25,7 @@
   function facts(name, values) {
     id(name).replaceChildren(...values.flatMap(([key, value]) => [node('dt',key), node('dd',value ?? '—')]));
   }
-  function chart(target, samples, colors, {windowLabel, kind = 'line', compact = false}) {
+  function chart(target, samples, colors, {windowLabel, endLabel = 'Now', kind = 'line', compact = false, markers = []}) {
     const left = compact ? 30 : 65, top = 23, width = compact ? 310 : 820;
     const height = compact ? 105 : 145, base = top + height;
     const max = Math.max(1, Math.ceil(Math.max(0, ...samples.flat().filter(Number.isFinite))));
@@ -60,9 +60,15 @@
         marks.push(svg('path',{d:path,fill:'none',stroke:color,'stroke-width':2.5}));
       }
     });
+    for (const {index, label} of markers) {
+      const x = left + step * (index + .5);
+      const line = svg('line', {x1:x, x2:x, y1:top, y2:base, stroke:'#ffc37a', 'stroke-dasharray':'5 4'});
+      line.append(svg('title', {}, label));
+      marks.push(line);
+    }
     const axisY = compact ? base + 25 : 201;
     marks.push(svg('text',{x:left,y:axisY},windowLabel));
-    marks.push(svg('text',{x:left+width,y:axisY,'text-anchor':'end'},'Now'));
+    marks.push(svg('text',{x:left+width,y:axisY,'text-anchor':'end'},endLabel));
     target.replaceChildren(...marks);
   }
   function poll(callback, unavailable, interval = 2500) {
@@ -93,6 +99,7 @@
   }
   window.addEventListener('sentinel-auth-changed', event => {
     const operator = id('console-operator');
+    if (!operator) return;
     operator.dataset.signedIn = event.detail.authenticated;
     operator.textContent = event.detail.authenticated ? 'Operator signed in' : 'Operator sign-in';
   });

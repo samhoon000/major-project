@@ -1,7 +1,44 @@
-<header class="console-heading">
-  <div><h1>Sentinel</h1><p>Real-Time Intrusion Detection &amp; Application Security</p></div>
-  <span id="overview-connection" class="console-status" role="status">Checking connection</span>
+<header class="console-heading overview-hero">
+  <div><p class="console-kicker">Sentinel / Security Operations</p>
+    <h1>Autonomous Network Threat Detection and Mitigation System Using Artificial Intelligence</h1>
+  </div>
+  <!-- local lab -->
 </header>
+<section class="console-card" aria-labelledby="pipeline-heading">
+  <h2 id="pipeline-heading">Detection pipeline</h2>
+  <ol id="overview-pipeline" class="console-pipeline">
+    <li>Network Traffic<span>Checking</span></li><li>Packet Capture<span>Checking</span></li>
+    <li>Flow Analysis<span>Checking</span></li><li>GATv2 AI<span>Checking</span></li>
+    <li>Threat Detection<span>Checking</span></li><li>Alerts<span>Checking</span></li>
+    <li>Automatic Mitigation<span>Checking</span></li>
+  </ol>
+</section>
+<dl id="overview-network-metrics" class="console-metrics" aria-label="Network security metrics"></dl>
+<div class="console-grid overview-primary-grid">
+  <section class="console-card">
+    <h2>Live network activity</h2>
+    <p id="overview-network-current" class="console-caption">Checking capture.</p>
+    <div class="console-key"><span style="--series:#62d9ce">Packets/s</span><span style="--series:#9aafff">KiB/s</span><span style="--series:#ffc37a">New suspicious predictions</span></div>
+    <svg class="console-chart" id="overview-network-chart" viewBox="0 0 900 215" role="img" aria-label="Traffic and suspicious prediction samples over the last minute" hidden></svg>
+  </section>
+  <section class="console-card">
+    <h2>System health</h2>
+    <dl class="console-facts" id="overview-health"></dl>
+    <p id="overview-classification" class="console-caption"></p>
+    <a class="console-link" href="/dashboard/network">Open Network Analysis</a>
+  </section>
+</div>
+<section id="overview-http" class="console-card" hidden>
+  <div class="console-section-head">
+    <h2>Local HTTP protection</h2>
+    <span id="overview-http-status" class="console-status">Checking</span>
+  </div>
+  <dl class="console-facts" id="overview-http-evidence"></dl>
+</section>
+<div class="console-section-head overview-application-head">
+  <h2>Application security</h2>
+  <span id="overview-connection" class="console-status" role="status">Checking stream</span>
+</div>
 <dl id="overview-metrics" class="console-metrics"></dl>
 <section class="console-card" aria-labelledby="activity-heading">
   <h2 id="activity-heading">Security activity</h2>
@@ -14,7 +51,10 @@
   <section class="console-card" aria-labelledby="overview-app-heading">
     <h2 id="overview-app-heading">Northfield Student Portal</h2>
     <dl class="console-facts" id="overview-app"></dl>
-    <a class="console-link" id="overview-monitor" href="/dashboard/applications">View Monitoring</a>
+    <div class="console-actions">
+      <a class="console-link" id="overview-monitor" href="/dashboard/applications">View Monitoring</a>
+      <!-- northfield evidence -->
+    </div>
   </section>
   <section class="console-card" aria-labelledby="overview-recent-heading">
     <h2 id="overview-recent-heading">Recent security events</h2>

@@ -8,6 +8,10 @@
     '#events','#attackHistory','#interfaceInfo'
   ]);
   function forwardLegacySection() {
+    if (location.hash === '#http-flood-panel' && id('launch-demo-lab')) {
+      location.replace('/attack-lab');
+      return true;
+    }
     if (location.hash === '#userRows' || location.hash === '#blockedUsers') {
       location.replace('/dashboard/chat' + location.hash);
       return true;
@@ -55,7 +59,8 @@
       .filter(receipt => receipt.request_id && ['blocked','rate_limited'].includes(receipt.outcome))
       .map(receipt => [receipt.timestamp,'Request blocked', channel.app]));
     const recent = [
-      ...alerts.map(alert => [alert.last_seen / 1000,'Threat detected',alert.app]),
+      ...alerts.map(alert => [alert.last_seen / 1000,'Threat detected',alert.app,
+        [alert.severity, alert.rule, alert.status].filter(Boolean).join(' · ')]),
       ...(data?.protection?.decisions || []).filter(decision => decision.expires)
         .map(decision => [decision.created / 1000,'Mitigation proposed',decision.app]),
       ...(staging?.audit || []).filter(item => item.operation === 'approve')
@@ -78,10 +83,10 @@
     id('overview-chart').style.display = graphReady ? '' : 'none';
     id('overview-activity').textContent = !graphReady ? 'Waiting for application evidence.' :
       samples.some(([detections, blocks]) => detections || blocks) ? '' : 'No detections or confirmed blocks in this window.';
-    id('overview-events').replaceChildren(...recent.slice(0,5).map(([timestamp, name, app]) => {
+    id('overview-events').replaceChildren(...recent.slice(0,5).map(([timestamp, name, app, details]) => {
       const item = node('li');
       const time = new Date(timestamp * 1000);
-      item.append(node('span',name + ' · ' + appName(app)),node('time',time.toLocaleString()));
+      item.append(node('span',[name, appName(app), details].filter(Boolean).join(' · ')),node('time',time.toLocaleString()));
       return item;
     }));
     if (!recent.length) id('overview-events').append(node('li', data ? 'No security events recorded.' : 'Waiting for telemetry.'));
@@ -123,4 +128,124 @@
   window.addEventListener('sentinel-auth-changed',connect);
   window.SentinelAuth.ready.then(connect);
   window.addEventListener('pagehide',() => { disposed = true; clearTimeout(deadline); clearTimeout(retry); socket?.close(); });
+})();
+
+(() => {
+  const {id, status, metrics, facts, chart, poll, read} = window.SentinelConsole;
+  const local = Boolean(id('launch-demo-lab'));
+  const history = new Map();
+  const pipeline = id('overview-pipeline').children;
+  let network, lab, stream, streamOpen = false, retry, disposed = false, priorAnomalies;
+
+  function render() {
+    const capture = network?.capture;
+    const running = capture === 'running';
+    const predictions = network?.gatv2_analyses;
+    const suspicious = network?.gatv2_network_anomalies;
+    const completed = network?.completed_flows?.length;
+    const alerts = lab?.timeline || [];
+    const alert = alerts.find(event => event.type === 'HTTP_SECURITY_ALERT');
+    const rule = alerts.find(event => event.type === 'HTTP_MITIGATION_ACTIVATED');
+    const verified = alerts.find(event => event.type === 'HTTP_PROTECTION_VERIFIED');
+    const captureStatus = running ? 'Running' : capture === 'starting' ? 'Starting' : 'Unavailable';
+    const modelStatus = network?.gatv2 === 'available' ? 'Loaded' : 'Unavailable';
+    const mitigationStatus = lab?.blocked ? 'HTTP restriction active' : verified ? 'HTTP rejection verified' :
+      network?.quarantine_count ? 'Network quarantine active' : lab ? 'HTTP guard available' : 'Awaiting evidence';
+    const stages = [
+      [network?.packets > 0, network?.packets > 0 ? 'Packets observed' : 'Waiting for packets'],
+      [running, captureStatus],
+      [completed > 0, completed > 0 ? 'Flows available' : 'Waiting for flows'],
+      [modelStatus === 'Loaded', modelStatus],
+      [suspicious > 0 || Boolean(alert), suspicious > 0 || alert ? 'Activity flagged' : 'No evidence yet'],
+      [Boolean(alert), alert ? 'HTTP alert recorded' : 'See application events'],
+      [Boolean(lab?.blocked || verified || network?.quarantine_count), mitigationStatus]
+    ];
+    stages.forEach(([complete, label], index) => {
+      pipeline[index].dataset.complete = complete;
+      pipeline[index].querySelector('span').textContent = label;
+    });
+    metrics('overview-network-metrics', [
+      ['Packets captured', running || network?.packets ? network.packets : null],
+      ['Completed flows · retained', network && (running || completed) ? completed : null],
+      ['AI predictions', modelStatus === 'Loaded' ? predictions : null],
+      ['Suspicious flows', modelStatus === 'Loaded' ? suspicious : null],
+      ['Active local restrictions', network ? network.quarantine_count + Number(Boolean(lab?.blocked)) : null],
+      ['Local HTTP 429 responses', lab?.flood?.blocked]
+    ]);
+    facts('overview-health', [
+      ['Packet capture', captureStatus],
+      ['Capture interface', network?.selected_adapter_name || network?.interface],
+      ['GATv2 model', modelStatus],
+      ['Dashboard event stream', local ? streamOpen ? 'Connected' : 'Connecting or unavailable' : 'See application stream'],
+      ['Response policy', mitigationStatus],
+      ['Quarantined nodes', network?.quarantined_ips?.join(', ') || '—']
+    ]);
+    id('overview-classification').textContent = predictions > 0 && suspicious != null ?
+      `GATv2 binary classification · ${predictions - suspicious} benign · ${suspicious} suspicious` :
+      'Awaiting GATv2 classifications.';
+    id('overview-network-current').textContent = running ?
+      `${network.packets_per_second} packets/s · ${network.bytes_per_second} bytes/s · ${completed} retained completed flows` :
+      'Waiting for active packet capture.';
+    if (local) {
+      id('overview-http').hidden = false;
+      status('overview-http-status', lab?.blocked ? 'Restriction active' : verified ? 'HTTP 429 verified' :
+        lab?.running ? 'Observing requests' : lab ? 'Awaiting evidence' : 'Local evidence unavailable',
+      lab?.blocked ? 'warn' : verified ? 'good' : '');
+      const time = value => new Date(value * 1000).toLocaleTimeString();
+      facts('overview-http-evidence', [
+        ['Security alert', alert ? `${alert.severity} · ${alert.alert_id} · ${time(alert.timestamp)}` : 'No current-run alert'],
+        ['Source and identity', alert ? `${alert.detection_method} · ${alert.source_identity}` : null],
+        ['Automatic mitigation', rule ? `${lab.blocked ? 'Active' : 'Expired'} · ${rule.target} · ${time(rule.expires_at)}` : 'Pending'],
+        ['Verified enforcement', verified ? `HTTP ${verified.status_code} observed at ${time(verified.timestamp)}` : 'Pending']
+      ]);
+    }
+  }
+
+  function applyLab(snapshot) {
+    if (!lab || snapshot.snapshot_at >= lab.snapshot_at) lab = snapshot;
+  }
+
+  function connectEvents() {
+    if (!local || disposed) return;
+    const url = new URL('/ws/dashboard', location.href);
+    url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    stream = new WebSocket(url);
+    stream.onopen = () => { streamOpen = true; render(); };
+    stream.onmessage = event => {
+      const data = JSON.parse(event.data);
+      if (data.type !== 'HTTP_FLOOD_TELEMETRY' || data.profile !== 'policy-verification') return;
+      applyLab(data);
+      render();
+    };
+    stream.onclose = () => {
+      streamOpen = false;
+      if (!disposed) { render(); retry = setTimeout(connectEvents, 3000); }
+    };
+  }
+
+  poll(async signal => {
+    network = await read('/api/network/state', signal);
+    if (local) {
+      try { applyLab(await read('/api/attack-lab/verification', signal)); }
+      catch { if (!streamOpen) lab = null; }
+    }
+    if (disposed) return;
+    const bucket = Math.floor(Date.now() / 2500);
+    const anomalies = network.gatv2_network_anomalies;
+    if (network.capture === 'running') {
+      const delta = priorAnomalies != null && anomalies >= priorAnomalies ? anomalies - priorAnomalies : null;
+      history.set(bucket, [network.packets_per_second, network.bytes_per_second / 1024, delta]);
+    }
+    priorAnomalies = anomalies;
+    for (const index of history.keys()) if (index < bucket - 23) history.delete(index);
+    const plot = id('overview-network-chart');
+    plot.hidden = !history.size;
+    if (history.size) {
+      const samples = Array.from({length: 24}, (_, index) => history.get(bucket - 23 + index) || []);
+      chart(plot, samples, ['#62d9ce', '#9aafff', '#ffc37a'], {windowLabel: '60 s ago'});
+    }
+    render();
+  }, () => { network = null; id('overview-network-chart').hidden = true; render(); });
+  window.SentinelAuth.ready.then(connectEvents);
+  window.addEventListener('pagehide', () => { disposed = true; clearTimeout(retry); stream?.close(); });
 })();

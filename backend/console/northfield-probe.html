@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en"><head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Northfield Network Evidence · Sentinel</title>
+  <style>
+    .probe-actions { display:flex; flex-wrap:wrap; align-items:center; gap:12px; }
+    .probe-actions button:disabled { opacity:.55; cursor:default; }
+    .probe-actions a { margin:0; }
+    .probe-table td { overflow-wrap:anywhere; }
+    .probe-table code { font-size:.86em; }
+  </style>
+</head><body>
+<main>
+  <header class="console-heading">
+    <div><h1>Northfield Network Evidence</h1><p>Observe one real health request, its captured flow, and the resulting GATv2 prediction.</p></div>
+    <span class="console-status" id="probe-state" role="status">Checking operator session</span>
+  </header>
+  <section class="console-card" aria-label="Health probe controls">
+    <div class="probe-actions">
+      <button class="console-button" id="probe-start" disabled>Check Northfield Health</button>
+      <button class="console-button" id="probe-stop" disabled>Cancel</button>
+      <button class="console-button" id="probe-reset" disabled>Clear Runs</button>
+      <a href="http://127.0.0.1:8000/" target="_blank" rel="noopener">Open Northfield</a>
+      <a href="/dashboard/network">Network Analysis</a>
+    </div>
+    <p id="probe-feedback" class="console-caption" role="status"></p>
+  </section>
+  <div class="console-grid">
+    <section class="console-card"><h2>Northfield response</h2><dl class="console-facts" id="probe-http"></dl></section>
+    <section class="console-card"><h2>Capture and GATv2</h2><dl class="console-facts" id="probe-capture"></dl></section>
+  </div>
+  <section class="console-card" aria-labelledby="probe-runs-heading">
+    <h2 id="probe-runs-heading">Recorded Runs</h2>
+    <div class="console-table probe-table"><table>
+      <thead><tr><th scope="col">Run</th><th scope="col">HTTP response</th><th scope="col">Captured TCP flow</th><th scope="col">GATv2</th></tr></thead>
+      <tbody id="probe-runs"></tbody>
+    </table></div>
+  </section>
+  <section class="console-card">
+    <h2>Northfield enforcement</h2>
+    <p>Health checks are outside the signed course-access policy. Use Monitored Applications to inspect a separate staging restriction, its acknowledgment, and the signed rejection receipt.</p>
+    <a href="/dashboard/applications?app=northfield-staging">Open Northfield policy evidence</a>
+  </section>
+</main>
+<script>/* probe script */</script>
+</body></html>

@@ -7,12 +7,14 @@ import os
 import threading
 import time
 from collections import deque
+from uuid import uuid4
 
 from backend.chat_service import state as chat_state
 from backend.network.capture import PacketCapture
 from backend.network.enforcement import QuarantineManager, Quarantine
 from backend.network.flow_tracker import FlowTracker
 from backend.network.gatv2_inference import gatv2_engine
+from backend.network.port_scan import PortScanMonitor
 
 log = logging.getLogger(__name__)
 
@@ -31,10 +33,13 @@ class NetworkRuntime:
         self.byte_count = 0
         self.analysis_count = 0
         self.anomaly_count = 0
+        self.network_anomaly_count = 0
+        self.graph_count = 0
         self.completed_flows = deque(maxlen=300)
         self.started_at = time.monotonic()
         self.inference_window = float(os.getenv("GATV2_INFERENCE_WINDOW_SECONDS", "5"))
         self.quarantine_manager = QuarantineManager()
+        self.port_scan = PortScanMonitor()
         self.tracker = FlowTracker(
             idle_timeout=float(os.getenv("FLOW_IDLE_TIMEOUT", "15")),
             max_duration=float(os.getenv("FLOW_MAX_DURATION", "120")),
@@ -54,6 +59,7 @@ class NetworkRuntime:
         log.info("[CAPTURE] Startup requested interface=%s filter=%s", interface or "<unset>", self.capture.bpf_filter)
 
     def _packet(self, packet: dict) -> None:
+        self.port_scan.observe(packet)
         session = chat_state.resolve_flow_session(packet)
         timestamp = float(packet["timestamp"])
         length = int(packet["packet_length"])
@@ -92,6 +98,7 @@ class NetworkRuntime:
         try:
             while True:
                 await asyncio.sleep(1)
+                self.port_scan.sample()
                 self.tracker.expire()
                 if self.quarantine_manager:
                     expired = self.quarantine_manager.expire()
@@ -155,6 +162,9 @@ class NetworkRuntime:
             await chat_state.event("gatv2_unavailable", {"error": str(exc), "flow_ids": [f["flow_id"] for f in flows]})
             return
 
+        graph_id = str(uuid4())
+        analyzed_at = time.time()
+        self.graph_count += 1
         for flow, result in zip(flows, results):
             chat_session_active = self._analysis_session_active(flow)
             if flow.get("chat_session_id") and not chat_session_active:
@@ -162,12 +172,19 @@ class NetworkRuntime:
                 continue
             anomaly = bool(result["is_anomaly"])
             self.analysis_count += 1
+            prediction = "ATTACK" if anomaly else "BENIGN"
+            confidence = float(result["confidence"]) / 100.0
+            self.network_anomaly_count += int(anomaly)
+            flow["network_inference"] = {
+                "graph_id": graph_id, "timestamp": analyzed_at, "prediction": prediction,
+                "confidence": confidence, "anomaly_probability": result["anomaly_probability"],
+                "threshold": result["threshold"], "nodes": result["graph_nodes"],
+                "edges": result["graph_edges"], "source": "GATv2",
+            }
             if anomaly and not chat_session_active:
                 # Keep ordinary flow telemetry without publishing an unsupported chat alert.
                 flow["gatv2_status"] = "observed"
                 continue
-            prediction = "ATTACK" if anomaly else "BENIGN"
-            confidence = float(result["confidence"]) / 100.0
             flow.update({"gatv2_status": "analyzed", "gatv2_prediction": prediction,
                          "gatv2_analyzed_at": time.time(),
                          "gatv2_confidence": confidence, "gatv2_anomaly_probability": result["anomaly_probability"],
@@ -282,6 +299,8 @@ class NetworkRuntime:
             "gatv2_error": None if gatv2_engine._is_loaded else "Model/scalers did not load; see server log.",
             "gatv2_analyses": self.analysis_count,
             "gatv2_anomalies": self.anomaly_count,
+            "gatv2_network_anomalies": self.network_anomaly_count,
+            "gatv2_graphs": self.graph_count,
             "gatv2_threshold": gatv2_engine.best_threshold if gatv2_engine._is_loaded else None,
             "latest_prediction": latest["gatv2_prediction"] if latest else None,
             "latest_analysis": ({key: latest.get(key) for key in (

@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Live Attack Lab · Sentinel</title>
+  <style>/* lab styles */</style>
+</head>
+<body class="lab-page">
+<main>
+  <header class="console-heading lab-hero">
+    <div>
+      <p class="console-kicker">Sentinel / localhost</p>
+      <h1>Live Attack Lab</h1>
+      <p>HTTP flood detection and autonomous mitigation</p>
+    </div>
+    <div class="console-actions">
+      <a class="console-button console-back" href="/dashboard/applications#http-flood-traffic" target="_blank" rel="noopener">View Live Graph</a>
+      <a class="console-button console-back" href="/dashboard">Back to Dashboard</a>
+    </div>
+  </header>
+  <section class="console-card lab-controls" aria-label="Demonstration controls">
+    <fieldset class="lab-settings" aria-describedby="lab-limits">
+      <legend>Local policy check</legend>
+      <div class="lab-parameters">
+        <label>Requests / second<input id="hf-rate" name="rate" type="number" value="1" readonly></label>
+        <label>Duration (seconds)<input id="hf-duration" name="duration" type="number" value="4" min="1" max="10" step="1" required></label>
+        <label>Concurrency<input id="hf-concurrency" name="concurrency" type="number" value="1" readonly></label>
+      </div>
+    </fieldset>
+    <div class="console-actions">
+      <button id="lab-start" class="console-button console-primary" type="button" disabled>Start Attack Demonstration</button>
+      <button id="lab-stop" class="console-button" type="button" disabled>Stop</button>
+      <button id="lab-reset" class="console-button" type="button" disabled>Reset</button>
+    </div>
+    <span id="lab-status" class="console-status" role="status">Checking local service</span>
+    <p id="lab-limits" class="console-caption">The check sends up to ten sequential loopback requests at one request per second. Choose at least four seconds to verify a subsequent HTTP 429.</p>
+    <p id="lab-error" class="console-caption" role="alert" hidden></p>
+  </section>
+  <section class="console-card" aria-labelledby="lifecycle-heading">
+    <h2 id="lifecycle-heading">Attack Lifecycle</h2>
+    <ol id="lab-lifecycle" class="console-pipeline lab-lifecycle">
+      <li>Traffic Observed<span>Pending</span></li>
+      <li>Threat Detected<span>Pending</span></li>
+      <li>Alert Generated<span>Pending</span></li>
+      <li>Automatic Mitigation<span>Pending</span></li>
+      <li>Protection Verified<span>Pending</span></li>
+    </ol>
+  </section>
+  <dl id="lab-metrics" class="console-metrics" aria-label="HTTP request metrics"></dl>
+  <div class="console-grid">
+    <section class="console-card">
+      <h2>Detection and enforcement</h2>
+      <dl id="lab-evidence" class="console-facts"></dl>
+    </section>
+    <section class="console-card">
+      <h2>Live event timeline</h2>
+      <ul id="lab-events" class="console-list"></ul>
+    </section>
+  </div>
+  <section id="lab-result" class="console-card" hidden>
+    <h2>Measured result</h2>
+    <p id="lab-result-message"></p>
+    <dl id="lab-result-facts" class="console-facts"></dl>
+  </section>
+  <section id="port-scan-lab" class="console-card" aria-labelledby="port-scan-lab-heading">
+    <div class="console-section-head">
+      <h2 id="port-scan-lab-heading">Port Scan Detection</h2>
+      <span id="port-scan-lab-status" class="console-status">Checking capture</span>
+    </div>
+    <p>Sentinel observes TCP packets from the selected capture interface. A check below verifies an active restriction on the dedicated HTTP endpoint.</p>
+    <dl id="port-scan-lab-facts" class="console-facts"></dl>
+    <div class="console-actions">
+      <a class="console-button console-back" href="/dashboard/applications#port-scan-monitor" target="_blank" rel="noopener">View Port Scan Activity</a>
+      <button id="port-scan-check" class="console-button" type="button">Check dedicated endpoint</button>
+    </div>
+    <p id="port-scan-feedback" role="status"></p>
+  </section>
+</main>
+<script>/* lab script */</script>
+</body>
+</html>

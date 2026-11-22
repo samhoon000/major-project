@@ -61,24 +61,45 @@
     const model = data?.gatv2 === 'available';
     const capture = !data ? message : running ? 'Capture active' : data.capture === 'starting' ? 'Capture starting' : 'Capture inactive';
     status('network-connection',capture,running ? 'good' : '');
-    const completed = (data?.completed_flows || []).slice().reverse();
+    const completed = (data?.completed_flows || []).slice().reverse().map(flow => {
+      const inference = flow.network_inference;
+      return inference ? {...flow, gatv2_status:'analyzed', gatv2_prediction:inference.prediction,
+        gatv2_analyzed_at:inference.timestamp, gatv2_anomaly_probability:inference.anomaly_probability,
+        gatv2_threshold:inference.threshold, graph_nodes:inference.nodes, graph_edges:inference.edges} : flow;
+    });
     const latest = completed.find(flow => flow.gatv2_status === 'analyzed');
+    const predictions = data?.gatv2_analyses;
+    const suspicious = data?.gatv2_network_anomalies ?? data?.gatv2_anomalies;
+    const stages = [
+      [data?.packets > 0, data?.packets > 0 ? data.packets + ' captured' : 'Waiting for packets'],
+      [completed.length > 0, completed.length ? completed.length + ' completed · retained' : 'Waiting for flows'],
+      [data?.gatv2_graphs > 0, data?.gatv2_graphs > 0 ? data.gatv2_graphs + ' built' : 'Waiting for graphs'],
+      [model, model ? 'Model loaded' : 'Unavailable'],
+      [predictions > 0, predictions > 0 ? (predictions - suspicious) + ' benign · ' + suspicious + ' suspicious' : 'Waiting for predictions']
+    ];
+    stages.forEach(([complete, text], index) => {
+      const stage = id('network-pipeline').children[index];
+      stage.dataset.complete = complete;
+      stage.querySelector('span').textContent = text;
+    });
     metrics('network-metrics',[['Packets per second',running ? data.packets_per_second : null],
-      ['Active flows',data?.active_flows?.length],['Anomalies · this run',data?.gatv2_anomalies],
-      ['Completed analyses · this run',data?.gatv2_analyses]]);
+      ['Bytes per second',running ? data.bytes_per_second : null], ['Active flows',data?.active_flows?.length],
+      ['AI predictions',model ? predictions : null]]);
     status('network-prediction',latest ? label(latest.gatv2_prediction) : 'No inference observed',
       latest?.gatv2_prediction === 'ATTACK' ? 'warn' : latest ? 'good' : '');
     facts('network-model',[['Model',!data ? 'Unknown' : model ? 'Online' : 'Offline'],
-      ['Last inference',observedAt(latest?.gatv2_analyzed_at)],
+      ['Last inference',observedAt(latest?.gatv2_analyzed_at)],['Graph ID',latest?.network_inference?.graph_id],
+      ['Graph nodes / edges',latest?.graph_nodes != null ? latest.graph_nodes + ' / ' + latest.graph_edges : null],
+      ['Flow',latest ? latest.source_ip + ' → ' + latest.destination_ip + ' · ' + latest.protocol : null],
       ['Anomaly probability',score(latest?.gatv2_anomaly_probability)],['Threshold',score(latest?.gatv2_threshold ?? data?.gatv2_threshold)]]);
     const end = Math.floor(Date.now() / (interval * 1000));
-    if (running) samples.set(end,data.packets_per_second);
+    if (running) samples.set(end,[data.packets_per_second, data.bytes_per_second / 1024]);
     for (const tick of samples.keys()) if (tick < end - 23) samples.delete(tick);
     if (!data) samples.clear();
-    const points = Array.from({length:24},(_,index) => [samples.get(end - 23 + index)]);
+    const points = Array.from({length:24},(_,index) => samples.get(end - 23 + index) || []);
     const plot = id('network-chart');
     plot.style.display = samples.size ? '' : 'none';
-    if (samples.size) chart(plot,points,['#93c4ff'],{windowLabel:'60 s ago'});
+    if (samples.size) chart(plot,points,['#62d9ce','#9aafff'],{windowLabel:'60 s ago'});
     else plot.replaceChildren();
     id('network-chart-status').textContent = running ? data.packets_per_second === 0 ? 'No packets in the latest sample.' : '' :
       'Waiting for active capture.';
@@ -89,7 +110,11 @@
     if (!id('network-anomalies').children.length) id('network-anomalies').append(node('li',data ? 'No model anomalies recorded.' : message));
     id('network-flows').replaceChildren(...flows.slice(0,25).map(flow => {
       const row = node('tr');
-      row.append(...[flow.source_ip,flow.destination_ip,flow.protocol,flow.total_packets,label(flow.gatv2_prediction)]
+      const endpoint = (host, port) => port == null ? host : `${host}:${port}`;
+      row.append(...[endpoint(flow.source_ip, flow.source_port), endpoint(flow.destination_ip, flow.destination_port),
+        flow.protocol, flow.total_packets, flow.total_bytes,
+        typeof flow.duration === 'number' ? `${(flow.duration * 1000).toFixed(2)} ms` : null,
+        label(flow.gatv2_prediction)]
         .map(value => node('td',value ?? '—')));
       return row;
     }));

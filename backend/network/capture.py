@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+from contextlib import ExitStack, closing
 from typing import Callable, Optional
 
 from backend.network.adapter_detector import (
@@ -13,6 +14,7 @@ from backend.network.adapter_detector import (
 )
 
 log = logging.getLogger(__name__)
+NPCAP_LOOPBACK = r"\Device\NPF_Loopback"
 
 
 def is_npcap_available() -> bool:
@@ -41,7 +43,7 @@ def parse_scapy_packet(packet) -> dict | None:
             transport, protocol, flags = packet[UDP], "UDP", None
         else:
             return None
-        return {
+        parsed = {
             "timestamp": float(packet.time),
             "source_ip": ip.src,
             "destination_ip": ip.dst,
@@ -51,6 +53,12 @@ def parse_scapy_packet(packet) -> dict | None:
             "packet_length": int(len(ip)),
             "tcp_flags": flags,
         }
+        if protocol == "TCP":
+            for attribute, field in (("seq", "tcp_sequence"), ("ack", "tcp_ack")):
+                value = getattr(transport, attribute, None)
+                if value is not None:
+                    parsed[field] = int(value)
+        return parsed
     except (AttributeError, TypeError, ValueError, IndexError):
         return None
 
@@ -168,14 +176,19 @@ class PacketCapture:
 
             self._stop.clear()
 
-            def run():
+            def run_capture(resources):
                 first_run = True
+                source = {"iface": self.interface, "filter": self.bpf_filter or None}
                 while not self._stop.is_set():
                     try:
-                        from scapy.all import sniff
+                        from scapy.all import conf, sniff
+
+                        if first_run and self.interface.casefold() == NPCAP_LOOPBACK.casefold():
+                            # Keep the device open between timed reads so short loopback flows aren't lost.
+                            socket = resources.enter_context(closing(conf.L2listen(**source)))
+                            source = {"opened_socket": socket}
                         sniff(
-                            iface=self.interface,
-                            filter=self.bpf_filter or None,
+                            **source,
                             prn=self._handle,
                             store=False,
                             timeout=1,
@@ -201,6 +214,10 @@ class PacketCapture:
                         self.status = "unavailable"
                         log.exception("[CAPTURE] Capture exception")
                         break
+
+            def run():
+                with ExitStack() as resources:
+                    run_capture(resources)
 
             self._thread = threading.Thread(target=run, name="scapy-capture", daemon=True)
             self._thread.start()

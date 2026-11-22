@@ -12,8 +12,9 @@ from pydantic import BaseModel
 from backend.chat_service import router as chat_router
 from backend.attack_lab import router as attack_lab_router
 from backend.network.runtime import network_runtime
+from backend.network.northfield_probe import northfield_probe
 from backend.network.tunnel import tunnel_manager
-from backend.security.http_flood import HTTPFloodGuard, http_flood_simulator
+from backend.security.http_flood import HTTPFloodGuard, http_flood_simulator, policy_verification
 from backend.security.demo_access import DemoExposure, DemoCORSMiddleware, router as auth_router, public_origin
 from backend.config import HOST, PORT
 from backend.telemetry.dashboard import router as telemetry_dashboard_router
@@ -41,6 +42,8 @@ app.add_middleware(DemoExposure)
 @app.on_event("shutdown")
 async def stop_http_flood_simulation():
     await http_flood_simulator.close()
+    await policy_verification.close()
+    await northfield_probe.stop()
 
 DATASET_PATH = "data/full_dataset.csv"
 GRAPH_IMG_PATH = "data/network_graph.png"

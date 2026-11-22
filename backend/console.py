@@ -5,8 +5,9 @@ from pathlib import Path
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+from backend.network.northfield_probe import enabled as network_probe_enabled
 from backend.security.demo_access import (
-    boundary, dashboard_remote_enabled, demo_security, is_remote_operator_console, remote_enabled,
+    boundary, demo_security, is_remote_operator_console,
 )
 from backend.security_ui import security_panel
 
@@ -14,9 +15,8 @@ router = APIRouter()
 FILES = Path(__file__).with_name("console")
 NAVIGATION = (
     ("overview", "/dashboard", "Overview"),
-    ("applications", "/dashboard/applications", "Monitored Applications"),
-    ("lab", "/attack-lab", "Attack Lab"),
     ("network", "/dashboard/network", "Network Analysis"),
+    ("applications", "/dashboard/applications", "Monitored Applications"),
     ("chat-security", "/dashboard/chat", "Chat Security"),
     ("settings", "/dashboard/settings", "Settings"),
 )
@@ -27,7 +27,7 @@ def navigation(request, active):
     operator_console = is_remote_operator_console(request) and demo_security.can_view(request)
     links = []
     for key, url, name in NAVIGATION:
-        if not (local or operator_console) and (key == "applications" or key == "lab" and dashboard_remote_enabled() and not remote_enabled()):
+        if key == "applications" and not (local or operator_console):
             continue
         current = ' aria-current="page"' if key == active else ""
         links.append(f'<a href="{url}"{current}>{name}</a>')
@@ -51,6 +51,12 @@ def page(request, name):
     body = (FILES / f"{name}.html").read_text(encoding="utf-8")
     script = (FILES / f"{name}.js").read_text(encoding="utf-8")
     auth = security_panel() if name == "settings" else ""
+    if name == "overview" and boundary(request).local:
+        body = body.replace("<!-- local lab -->",
+                            '<a class="console-button console-primary" id="launch-demo-lab" href="/attack-lab">Launch Demo Lab</a>')
+        if network_probe_enabled():
+            body = body.replace("<!-- northfield evidence -->",
+                                '<a class="console-link" href="/attack-lab?view=northfield">Northfield Network Evidence</a>')
     title = next((label for key, _, label in NAVIGATION if key == name), "Chat Security")
     document = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">

@@ -279,13 +279,18 @@ class NetworkRuntimeChatScopeTests(unittest.IsolatedAsyncioTestCase):
         self.runtime._packet(self.packet)
         self.runtime.tracker.expire(force=True)
         flow = self.runtime._take_pending()[0]
+        result = {"is_anomaly": True, "confidence": 88.0, "anomaly_probability": 0.88,
+                  "threshold": 0.53, "graph_nodes": 2, "graph_edges": 1}
         with patch("backend.network.runtime.gatv2_engine._is_loaded", True), \
-             patch("backend.network.runtime.gatv2_engine.predict_flows", return_value=[{"is_anomaly": True}]), \
+             patch("backend.network.runtime.gatv2_engine.predict_flows", return_value=[result]), \
              patch.object(self.runtime.quarantine_manager, "handle_attack") as quarantine:
             await self.runtime._analyze([flow])
         status = self.runtime.status()
         self.assertEqual(status["gatv2_analyses"], 1)
         self.assertEqual(status["gatv2_anomalies"], 0)
+        self.assertEqual(status["gatv2_network_anomalies"], 1)
+        self.assertEqual(status["gatv2_graphs"], 1)
+        self.assertEqual(flow["network_inference"]["anomaly_probability"], 0.88)
         self.assertEqual(status["completed_flows"][0]["gatv2_status"], "observed")
         self.assertIsNone(flow["gatv2_prediction"])
         quarantine.assert_not_called()

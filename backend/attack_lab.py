@@ -8,9 +8,13 @@ import time
 from collections import deque
 
 from fastapi import APIRouter, HTTPException, Request, Header, Depends
-from fastapi.responses import HTMLResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
+from starlette.background import BackgroundTask
 
 from backend.network.runtime import network_runtime
+from backend.network.northfield_probe import enabled as probe_enabled, northfield_probe
+from backend.network.port_scan import VERIFY_PATH
+from backend.security.http_flood import PolicyCheckConfig, RunConfig, http_flood_simulator, policy_verification
 
 router = APIRouter()
 
@@ -314,7 +318,23 @@ def attack_lab_page(request: Request) -> str:
 
     local = boundary(request).local
     remote_console = is_remote_operator_console(request) and demo_security.can_view(request)
-    if (local or remote_console) and request.query_params.get("view") != "legacy":
+    if request.query_params.get("view") == "northfield":
+        if not local or not probe_enabled():
+            raise HTTPException(404)
+        from backend.console import FILES, wrap_existing
+
+        document = (FILES / "northfield-probe.html").read_text(encoding="utf-8")
+        script = (FILES / "northfield-probe.js").read_text(encoding="utf-8")
+        return wrap_existing(request, "lab", document.replace("/* probe script */", script))
+    if local:
+        from backend.console import FILES
+
+        document = (FILES / "attack-lab.html").read_text(encoding="utf-8")
+        style = (FILES / "layout.css").read_text(encoding="utf-8")
+        script = "\n".join((FILES / name).read_text(encoding="utf-8")
+                           for name in ("layout.js", "attack-lab.js", "port-scan.js"))
+        return document.replace("/* lab styles */", style).replace("/* lab script */", script)
+    if remote_console and request.query_params.get("view") != "legacy":
         from backend.console import wrap_existing
         document = """<!doctype html>
 <html lang="en">
@@ -337,24 +357,130 @@ def attack_lab_page(request: Request) -> str:
     <h2 id="northfield-target">Northfield Student Portal</h2>
     <p>Watch signed portal traffic, detection evidence, and policy status in Monitored Applications.</p>
     <nav aria-label="Lab destinations">
+      <!-- northfield probe -->
       <a class="console-link" href="/dashboard/applications?app=northfield-staging">View Live Monitoring</a>
     </nav>
     <!-- lab access -->
   </section>
 </main>
 </html>"""
-        advanced = (
-            '<details class="console-card"><summary>Advanced labs</summary>'
-            '<a href="/attack-lab?view=legacy">Advanced · Legacy HTTP Flood Lab</a></details>'
-            if local else '<p>Advanced lab controls are available from the local console.</p>'
-        )
-        return wrap_existing(request, "lab", document.replace("<!-- lab access -->", advanced))
+        return wrap_existing(request, "lab", document.replace(
+            "<!-- lab access -->", "<p>The local policy check is available on the host computer.</p>"))
     return ATTACK_LAB_HTML.replace("</header>", "</header>" + security_panel(), 1).replace("<!-- HTTP_FLOOD_PANEL -->", http_flood_panel(controls=True))
 
 
+def require_probe_session(request: Request):
+    from backend.security.demo_access import boundary, demo_security
+
+    if not probe_enabled() or not boundary(request).local:
+        raise HTTPException(404)
+    if not demo_security.session(request):
+        raise HTTPException(401, "Operator sign-in required")
+
+
+@router.get("/api/attack-lab/northfield-probe")
+async def probe_state(request: Request):
+    require_probe_session(request)
+    return northfield_probe.snapshot(network_runtime.status())
+
+
+@router.post("/api/attack-lab/northfield-probe/{action}")
+async def probe_command(request: Request, action: str):
+    from backend.telemetry.dashboard import require_operator
+
+    require_probe_session(request)
+    require_operator(request)
+    if request.query_params or request.headers.get("content-length") not in (None, "0") or request.headers.get("transfer-encoding"):
+        raise HTTPException(422, "The probe does not take target or workload parameters")
+    if action == "start":
+        run_id = northfield_probe.start()
+        if run_id is None:
+            raise HTTPException(429, "Wait for the probe cooldown")
+        return {"run_id": run_id}
+    if action == "stop":
+        await northfield_probe.stop()
+    elif action == "reset":
+        await northfield_probe.reset()
+    else:
+        raise HTTPException(404)
+    return {"status": action}
+
+
 @router.get("/api/attack-lab/http-flood-target")
-async def http_flood_target() -> dict:
-    return {"status": "ok", "run_id": http_flood_simulator.run_id}
+async def http_flood_target(request: Request) -> dict:
+    return {"status": "ok", "run_id": request.state.http_lab_run_id}
+
+
+@router.get("/api/attack-lab/verification")
+async def verification_state(request: Request):
+    from backend.security.demo_access import boundary
+
+    if not boundary(request).local:
+        raise HTTPException(404)
+    return policy_verification.get_state()
+
+
+@router.get("/api/attack-lab/port-scan")
+async def port_scan_snapshot(request: Request):
+    from backend.security.demo_access import boundary, demo_security
+
+    if not boundary(request).local or not demo_security.can_view(request):
+        raise HTTPException(404)
+    capture = network_runtime.capture
+    return {**network_runtime.port_scan.snapshot(),
+            "capture": capture.status if capture else "unavailable",
+            "interface": capture.adapter_name if capture else None}
+
+
+@router.post(VERIFY_PATH)
+async def port_scan_verify(request: Request):
+    from backend.security.demo_access import boundary, demo_security
+
+    if not boundary(request).local or not request.client:
+        raise HTTPException(404)
+    demo_security.check_origin(request, required=True)
+    listener = request.scope.get("server")
+    pair = (request.client.host, listener[0]) if listener else None
+    monitor = network_runtime.port_scan
+    alert_id = monitor.restriction(pair) if pair else None
+    if alert_id:
+        return JSONResponse({"status": "restricted", "alert_id": alert_id, "scope": VERIFY_PATH},
+                            status_code=429, background=BackgroundTask(monitor.record_rejection, pair, alert_id))
+    return {"status": "allowed", "scope": VERIFY_PATH}
+
+
+def require_verification_control(request: Request):
+    from backend.security.demo_access import boundary, demo_security
+
+    if not boundary(request).local:
+        raise HTTPException(404)
+    demo_security.check_origin(request, required=True)
+    if request.query_params:
+        raise HTTPException(422, "The policy check takes no query parameters")
+
+
+@router.post("/api/attack-lab/verification/start", dependencies=[Depends(require_verification_control)])
+async def verification_start(request: Request, config: PolicyCheckConfig | None = None):
+    server = request.scope.get("server")
+    if not server or not server[1]:
+        raise HTTPException(503, "Cannot determine the local listener port")
+    host = "[::1]" if server[0] == "::1" else "127.0.0.1"
+    try:
+        return await policy_verification.start_check(f"http://{host}:{server[1]}", config)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@router.post("/api/attack-lab/verification/{action}", dependencies=[Depends(require_verification_control)])
+async def verification_command(request: Request, action: str):
+    if (request.headers.get("content-length") not in (None, "0")
+            or request.headers.get("transfer-encoding") or await request.body()):
+        raise HTTPException(422, "This action takes no parameters")
+    if action == "stop":
+        return await policy_verification.stop()
+    if action == "reset":
+        return await policy_verification.reset(stop_running=True)
+    raise HTTPException(404)
 
 
 async def require_lab_admin(request: Request, x_admin_token: str | None = Header(default=None)):
@@ -373,9 +499,6 @@ def lab_origin(request: Request):
     if not server or not server[1]:
         raise HTTPException(status_code=503, detail="Cannot determine the local listener port")
     return os.getenv("HTTP_FLOOD_BASE_URL") or f"http://127.0.0.1:{server[1]}"
-
-
-from backend.security.http_flood import RunConfig, http_flood_simulator
 
 
 @router.post("/api/attack-lab/http-flood/authorize", dependencies=[Depends(require_local_lab_admin)])
