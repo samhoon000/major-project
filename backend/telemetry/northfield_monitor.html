@@ -1,10 +1,11 @@
 <style>
-  #northfield-monitor { color:#edf4ff; background:#101b2b; border:1px solid #2c4059; border-radius:16px; padding:clamp(14px,3vw,28px); }
+  #northfield-monitor { color:var(--console-text,#edf4ff); background:var(--console-card,#101b2b); border:1px solid var(--console-line,#2c4059); border-radius:12px; padding:clamp(14px,3vw,28px); }
   #northfield-monitor h2 { font-size:clamp(1.65rem,4vw,2.7rem); margin:6px 0; line-height:1.1; }
   #northfield-monitor h3 { margin:0; font-size:1.14rem; }
   #northfield-monitor p { color:#b7c8de; margin:8px 0 0; }
   #northfield-monitor a { color:#a9d9ff; }
   .nf-header, .nf-chart-heading, .nf-policy { display:flex; align-items:start; justify-content:space-between; gap:16px; flex-wrap:wrap; }
+  .nf-header { padding-bottom:14px; border-bottom:1px solid var(--console-line,#2c4059); }
   .nf-badge { display:inline-block; border:1px solid currentColor; border-radius:999px; padding:5px 10px; font-size:.86rem; font-weight:650; color:#ffc66d; }
   .nf-badge[data-state="good"] { color:#73e7aa; }
   .nf-badge[data-state="critical"] { color:#ff9b9d; }

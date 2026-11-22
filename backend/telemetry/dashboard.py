@@ -67,7 +67,17 @@ async def applications_page(request: Request):
     elif legacy and showcase.config():
         page = page.replace('id="showcase-defense"', 'id="showcase-defense" data-enabled="true"')
     if not legacy:
-        from backend.console import wrap_existing
+        from backend.console import FILES, wrap_existing
+
+        if is_local(request):
+            chart = (FILES / "http-flood-traffic.html").read_text(encoding="utf-8")
+            style = (FILES / "http-flood-chart.css").read_text(encoding="utf-8")
+            script = "\n".join((FILES / name).read_text(encoding="utf-8")
+                               for name in ("http-flood-chart.js", "http-flood-traffic.js"))
+            page = page.replace("<!-- local HTTP flood traffic -->", f"<style>{style}</style>{chart}<script>{script}</script>")
+            scan = (FILES / "port-scan-monitor.html").read_text(encoding="utf-8")
+            scan_script = (FILES / "port-scan.js").read_text(encoding="utf-8")
+            page = page.replace("<!-- port scan monitor -->", f"{scan}<script>{scan_script}</script>")
         page = wrap_existing(request, "applications", page)
     else:
         page = page.replace("<!-- overview link -->", '<a href="/dashboard">Sentinel Overview</a>')

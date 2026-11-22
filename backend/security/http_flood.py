@@ -20,6 +20,7 @@ log = logging.getLogger(__name__)
 TARGET = "/api/attack-lab/http-flood-target"
 HEADER = "x-sentinel-lab-key"
 METHOD = "Rule-Based HTTP Flood Detection"
+POLICY_CHECK_MAX_REQUESTS = 10
 
 
 class RunConfig(BaseModel):
@@ -27,6 +28,13 @@ class RunConfig(BaseModel):
     rate: int = Field(default=25, ge=1, le=50, strict=True)
     duration: float = Field(default=8, ge=1, le=20, allow_inf_nan=False)
     concurrency: int = Field(default=4, ge=1, le=8, strict=True)
+
+
+class PolicyCheckConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    rate: int = Field(default=1, ge=1, le=1, strict=True)
+    duration: int = Field(default=4, ge=1, le=POLICY_CHECK_MAX_REQUESTS, strict=True)
+    concurrency: int = Field(default=1, ge=1, le=1, strict=True)
 
 
 @dataclass(frozen=True)
@@ -135,6 +143,8 @@ class HTTPFloodSimulator:
         now = self.clock()
         counts = self.counts[role]
         counts["received"] += 1
+        if role == "flood" and counts["received"] == 1:
+            self._event("HTTP_TRAFFIC_OBSERVED", "First request received at the isolated HTTP endpoint")
         window = self.source_windows[role]
         window.append(now)
         rps = len(window) / self.detector.window
@@ -147,12 +157,17 @@ class HTTPFloodSimulator:
         if not blocked and rps >= self.detector.block_rps and role == "flood":
             self.detected_at = self.wall_clock()
             self.detection_rps = rps
+            self._event("HTTP_FLOOD_ATTACK_DETECTED", "HTTP request rate reached the configured detection threshold",
+                        observed_rps=rps, severity="HIGH", detected_at=self.detected_at)
+            self._event("HTTP_SECURITY_ALERT", "Isolated HTTP request rate exceeded the configured policy",
+                        alert_id=f"http-{self.run_id}-{self.sequence}", severity="HIGH",
+                        observed_rps=rps, threshold_rps=self.detector.block_rps,
+                        status="open")
             self.block_until = now + self.detector.block_seconds
             self.status, self.recovered = "mitigation_active", False
-            self._event("HTTP_FLOOD_ATTACK_DETECTED", "HTTP FLOOD ATTACK DETECTED",
-                        observed_rps=rps, severity="HIGH", detected_at=self.detected_at)
-            self._event("HTTP_MITIGATION_ACTIVATED", "THREAT MITIGATED — SOURCE BLOCKED",
-                        block_seconds=self.detector.block_seconds, mitigation="Application-level HTTP 429")
+            self._event("HTTP_MITIGATION_ACTIVATED", "Temporary restriction applied to the isolated client",
+                        block_seconds=self.detector.block_seconds, mitigation="Application-level HTTP 429",
+                        expires_at=self.wall_clock() + self.detector.block_seconds)
             blocked = True
         counts["rejected" if blocked else "accepted"] += 1
         self.traffic.append((now, role, blocked))
@@ -298,7 +313,7 @@ class HTTPFloodSimulator:
             self.task = asyncio.create_task(self._run(), name="http-flood-generator")
             return self.get_state()
 
-    async def _request(self, client, role):
+    async def _request(self, client, role, *, verify_rejection=False):
         counts = self.counts[role]
         counts["generated"] += 1
         counts["in_flight"] += 1
@@ -312,7 +327,9 @@ class HTTPFloodSimulator:
                         if local and remote and len(self.endpoints) < 1000:
                             self.endpoints.add((str(local[0]), int(local[1]), str(remote[0]), int(remote[1])))
                 await response.aread()
-                if response.status_code == 200 and response.json().get("run_id") != self.run_id:
+                if (response.status_code == 200 or verify_rejection and response.status_code == 429) and (
+                    response.json().get("run_id") != self.run_id
+                ):
                     raise ValueError("Configured loopback origin is not this Sentinel lab instance")
                 key = "successful" if response.status_code == 200 else "blocked" if response.status_code == 429 else "failed"
                 counts[key] += 1
@@ -382,15 +399,16 @@ class HTTPFloodSimulator:
 
     async def stop(self):
         async with self.lock:
-            if self.task and not self.task.done():
-                self.task.cancel()
-                await asyncio.gather(self.task, return_exceptions=True)
-            # Cancellation before the coroutine's first step doesn't execute its
-            # finally block. Still publish an honest terminal state.
-            if self.started is not None and self.ended is None:
-                self.ended, self.status = self.wall_clock(), "attack_stopped"
-                self._event("HTTP_FLOOD_STOPPED", "Generator cancelled before dispatch")
+            await self._stop()
             return self.get_state()
+
+    async def _stop(self):
+        if self.task and not self.task.done():
+            self.task.cancel()
+            await asyncio.gather(self.task, return_exceptions=True)
+        if self.started is not None and self.ended is None:
+            self.ended, self.status = self.wall_clock(), "attack_stopped"
+            self._event("HTTP_FLOOD_STOPPED", "Run cancelled before dispatch")
 
     async def unblock(self):
         async with self.lock:
@@ -402,9 +420,11 @@ class HTTPFloodSimulator:
                 self._event("HTTP_SOURCE_UNBLOCKED", "Administrator removed application block", reason="manual")
             return self.get_state()
 
-    async def reset(self):
+    async def reset(self, *, stop_running=False):
         async with self.lock:
-            if self.task and not self.task.done():
+            if stop_running:
+                await self._stop()
+            elif self.task and not self.task.done():
                 raise ValueError("Stop the generator before resetting")
             tasks = [t for t in (self.monitor_task, self.publisher_task) if t]
             for task in tasks:
@@ -429,10 +449,93 @@ class HTTPFloodSimulator:
 http_flood_simulator = HTTPFloodSimulator()
 
 
+class HTTPPolicyVerification(HTTPFloodSimulator):
+    """Exercise the detector against a quota of three requests per four seconds."""
+
+    def __init__(self):
+        self.next_request_at = 0.0
+        super().__init__(DetectorConfig(window=4, warning_rps=0.5, block_rps=0.75, block_seconds=8))
+
+    def _clear(self):
+        super()._clear()
+        self.config = RunConfig(**PolicyCheckConfig().model_dump())
+        self.response_latencies = []
+        self.outcome = None
+
+    def get_state(self):
+        snapshot = super().get_state()
+        return dict(
+            snapshot, profile="policy-verification", outcome=self.outcome,
+            attack_name="Isolated HTTP rate-policy verification",
+            limits=dict(max_rate=1, max_requests=POLICY_CHECK_MAX_REQUESTS, max_concurrency=1,
+                        max_duration=POLICY_CHECK_MAX_REQUESTS),
+            latency_average_ms=round(sum(self.response_latencies) / len(self.response_latencies), 2)
+            if self.response_latencies else None,
+        )
+
+    async def start_check(self, base_url, config: PolicyCheckConfig | None = None):
+        async with self.lock:
+            if self._closed or self.started is not None:
+                raise ValueError("Reset the lab before starting another check")
+            self.base_url = validate_base_url(base_url)
+            self.config = RunConfig(**(config or PolicyCheckConfig()).model_dump())
+            self.started, self.status = self.wall_clock(), "attack_running"
+            self.task = asyncio.create_task(self._run_check(), name="http-policy-verification")
+            self._ensure_publisher()
+            return self.get_state()
+
+    async def _run_check(self):
+        async def check_responses():
+            async with self._client(1) as client:
+                counts = self.counts["flood"]
+                deadline = max(self.clock(), self.next_request_at) + self.config.duration
+                for _ in range(min(POLICY_CHECK_MAX_REQUESTS, int(self.config.duration))):
+                    await asyncio.sleep(max(0, self.next_request_at - self.clock()))
+                    now = self.clock()
+                    if now >= deadline:
+                        break
+                    self.next_request_at = now + 1
+                    previous_blocks, previous_errors = counts["blocked"], counts["failed"]
+                    await self._request(client, "flood", verify_rejection=True)
+                    if counts["failed"] > previous_errors:
+                        return "error"
+                    self.response_latencies.append(counts["latency_ms"])
+                    if previous_blocks == 1 and counts["blocked"] == 2:
+                        self._event("HTTP_PROTECTION_VERIFIED",
+                                    "Subsequent request received HTTP 429 from this lab",
+                                    status_code=429, rejected_requests=counts["blocked"])
+                return "complete"
+
+        try:
+            # Allow for the pacing delay from the preceding run and the last response.
+            async with asyncio.timeout(self.config.duration + 2):
+                self.outcome = await check_responses()
+        except TimeoutError:
+            self.error, self.outcome = "Verification timed out", "error"
+        except asyncio.CancelledError:
+            self.outcome = "stopped"
+            raise
+        except Exception as exc:
+            self.error, self.outcome = f"{type(exc).__name__}: {exc}", "error"
+            log.exception("HTTP policy check failed")
+        finally:
+            self.ended = self.wall_clock()
+            self.status = "error" if self.error else "attack_stopped"
+            self._event("HTTP_FLOOD_STOPPED", "Local HTTP policy check ended", outcome=self.outcome)
+
+    async def _stop(self):
+        await super()._stop()
+        if self.started is not None and self.outcome is None:
+            self.outcome = "stopped"
+
+
+policy_verification = HTTPPolicyVerification()
+
+
 class HTTPFloodGuard:
     def __init__(self, app, controller=None):
         self.app = app
-        self.controller = controller or http_flood_simulator
+        self.controller = controller
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http" or scope.get("path") != TARGET:
@@ -443,13 +546,25 @@ class HTTPFloodGuard:
             local_peer = ipaddress.ip_address(request.client.host).is_loopback
         except (ValueError, AttributeError):
             local_peer = False
-        role = self.controller.role_for_key(request.headers.get(HEADER, ""))
-        if not local_peer or request.headers.get("cf-connecting-ip") or request.headers.get("x-forwarded-for") or not role:
+        if not local_peer or any(request.headers.get(name) for name in (
+            "cf-connecting-ip", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "forwarded"
+        )):
             response = JSONResponse({"detail":"Isolated local lab capability required"}, status_code=403)
-        elif self.controller.observe(role):
-            response = JSONResponse({"detail":"Lab source temporarily rate limited"}, status_code=429,
-                headers={"Retry-After":str(max(1, math.ceil(self.controller.block_until-self.controller.clock())))})
         else:
-            await self.app(scope, receive, send)
-            return
+            response = JSONResponse({"detail":"Isolated local lab capability required"}, status_code=403)
+            controllers = ((self.controller,) if self.controller is not None
+                           else (http_flood_simulator, policy_verification))
+            for controller in controllers:
+                role = controller.role_for_key(request.headers.get(HEADER, ""))
+                if not role:
+                    continue
+                if controller.observe(role):
+                    response = JSONResponse(
+                        {"detail": "Lab source temporarily rate limited", "run_id": controller.run_id},
+                        status_code=429, headers={"Retry-After": str(max(1, math.ceil(
+                            controller.block_until - controller.clock())))})
+                    break
+                request.state.http_lab_run_id = controller.run_id
+                await self.app(scope, receive, send)
+                return
         await response(scope, receive, send)
