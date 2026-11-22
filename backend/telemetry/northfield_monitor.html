@@ -1,0 +1,88 @@
+<style>
+  #northfield-monitor { color:#edf4ff; background:#101b2b; border:1px solid #2c4059; border-radius:16px; padding:clamp(14px,3vw,28px); }
+  #northfield-monitor h2 { font-size:clamp(1.65rem,4vw,2.7rem); margin:6px 0; line-height:1.1; }
+  #northfield-monitor h3 { margin:0; font-size:1.14rem; }
+  #northfield-monitor p { color:#b7c8de; margin:8px 0 0; }
+  #northfield-monitor a { color:#a9d9ff; }
+  .nf-header, .nf-chart-heading, .nf-policy { display:flex; align-items:start; justify-content:space-between; gap:16px; flex-wrap:wrap; }
+  .nf-badge { display:inline-block; border:1px solid currentColor; border-radius:999px; padding:5px 10px; font-size:.86rem; font-weight:650; color:#ffc66d; }
+  .nf-badge[data-state="good"] { color:#73e7aa; }
+  .nf-badge[data-state="critical"] { color:#ff9b9d; }
+  #northfield-monitor .nf-metrics { grid-template-columns:repeat(4,minmax(0,1fr)); margin:20px 0 14px; }
+  #northfield-monitor .nf-metrics div, .nf-chart, .nf-student, .nf-policy { background:#162438; border:1px solid #324763; border-radius:10px; padding:14px; }
+  #northfield-monitor dt { color:#b7c8de; }
+  #northfield-monitor dd { font:700 clamp(1.15rem,3vw,1.75rem) system-ui,sans-serif; }
+  #nf-traffic { display:block; width:100%; max-height:265px; aspect-ratio: 850 / 280; overflow:visible; }
+  #nf-traffic text { fill:#c2d0e3; font-size:15px; }
+  .nf-legend, #nf-markers { display:flex; flex-wrap:wrap; gap:8px 20px; padding:0; margin:10px 0; list-style:none; }
+  .nf-legend li::before { content:''; display:inline-block; background:var(--series); width:.85em; height:.85em; margin-right:.45em; border-radius:2px; }
+  .nf-normal { --series:#69d7ae; }
+  .nf-suspicious { --series:#ffc66d; }
+  .nf-blocked { --series:#ff878e; }
+  .nf-other { --series:#94a9c8; }
+  .nf-total { --series:#edf4ff; }
+  #nf-markers { font-size:.9rem; color:#dbe6f4; }
+  .nf-comparison { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px; margin:14px 0; }
+  .nf-student strong { display:block; margin-top:8px; font-size:1.4rem; }
+  .nf-policy .alert-actions { margin:0; }
+  .nf-timeline { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); list-style:none; padding:0; gap:8px; }
+  .nf-timeline li { padding:8px; border:1px solid #324763; border-radius:8px; color:#b7c8de; }
+  .nf-timeline li[data-complete="true"] { color:#8ee8b8; border-color:#50836c; }
+  #northfield-monitor .alert-button { background:#20344f; border-color:#546f90; }
+  #advanced-mode summary { cursor:pointer; font-weight:650; padding-block:8px; }
+  @media (max-width:600px) {
+    #northfield-monitor .nf-metrics { grid-template-columns:repeat(2,minmax(0,1fr)); }
+    #nf-traffic { aspect-ratio: 850 / 335; }
+    #nf-traffic text { font-size:23px; }
+    .nf-timeline { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  }
+</style>
+<section id="northfield-monitor" aria-labelledby="northfield-title" hidden>
+  <div class="nf-header">
+    <div>
+      <h2 id="northfield-title">Northfield Student Portal</h2>
+      <p id="nf-last-observed">Last observed request unavailable</p>
+    </div>
+    <span class="nf-badge" id="nf-connection" role="status">Waiting for signed telemetry</span>
+  </div>
+  <dl class="nf-metrics" id="nf-metrics"></dl>
+  <section class="nf-chart" aria-labelledby="nf-chart-title">
+    <div class="nf-chart-heading">
+      <div>
+        <h3 id="nf-chart-title">Signed HTTP traffic</h3>
+        <p>Requests per second · last 2 minutes</p>
+      </div>
+      <span class="nf-badge" id="nf-threat" role="status">Waiting for detector</span>
+    </div>
+    <ul class="nf-legend" aria-label="Traffic legend">
+      <li class="nf-total">Total requests</li><li class="nf-normal">Normal</li><li class="nf-suspicious">Suspicious</li>
+      <li class="nf-blocked">Policy blocked</li><li class="nf-other">Other errors</li>
+    </ul>
+    <svg id="nf-traffic" viewBox="0 0 850 280" role="img" aria-label="Northfield requests per second over the last two minutes" aria-describedby="nf-chart-status nf-markers"></svg>
+    <p id="nf-chart-status">Waiting for a telemetry snapshot.</p>
+    <p id="nf-threshold"></p>
+    <ul id="nf-markers" aria-label="Security events in the current chart window"></ul>
+  </section>
+  <div class="nf-comparison">
+    <section class="nf-student" aria-labelledby="nf-first-title">
+      <h3 id="nf-first-title">Student 1</h3>
+      <strong id="nf-first-status">No observation</strong>
+      <p id="nf-first-detail">Student 1 · last course-access response</p>
+    </section>
+    <section class="nf-student" aria-labelledby="nf-second-title">
+      <h3 id="nf-second-title">Student 2</h3>
+      <strong id="nf-second-status">No observation</strong>
+      <p id="nf-second-detail">Student 2 · last course-access response</p>
+    </section>
+  </div>
+  <section class="nf-policy" aria-labelledby="nf-policy-title">
+    <div>
+      <h3 id="nf-policy-title">Threat &amp; mitigation</h3>
+      <p id="nf-policy-evidence"></p>
+      <p id="nf-policy-status" role="status">Waiting for policy receiver</p>
+      <p id="nf-policy-feedback" role="status"></p>
+    </div>
+    <div class="alert-actions" id="nf-policy-controls"></div>
+  </section>
+  <ol class="nf-timeline" id="nf-timeline" aria-label="Verified security stages"></ol>
+</section>

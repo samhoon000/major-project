@@ -1,0 +1,64 @@
+<header class="console-heading chat-heading">
+  <div>
+    <h1>Chat Security</h1>
+    <p>Real-Time Chat Monitoring &amp; Abuse Detection</p>
+  </div>
+  <a class="console-button chat-open" href="/chat">Open Secure Chat <span aria-hidden="true">↗</span></a>
+</header>
+<div class="chat-connections">
+  <span class="chat-health" role="status">Chat service <strong id="chat-service">Unknown</strong></span>
+  <span class="chat-health" role="status">Monitoring <strong id="chat-connection">Connecting</strong></span>
+  <span>Last update <time id="chat-updated">—</time></span>
+</div>
+<dl class="console-metrics" id="chat-metrics"></dl>
+<section class="console-card chat-activity" aria-labelledby="chat-activity-title">
+  <div class="chat-section-heading">
+    <h2 id="chat-activity-title">Live Chat Activity</h2>
+    <span class="console-caption">Last 60 seconds · messages per 5 sec</span>
+  </div>
+  <div class="console-key">
+    <span style="--series:var(--console-link)">Inspected messages</span>
+    <span style="--series:var(--console-amber)">Suspicious messages</span>
+    <span style="--series:var(--console-red)">Policy rejections</span>
+  </div>
+  <svg id="chat-chart" class="console-chart" viewBox="0 0 920 215" role="img" hidden></svg>
+  <p id="chat-chart-note" class="console-caption"></p>
+</section>
+<div class="console-grid chat-grid">
+  <section class="console-card chat-roster-card" aria-labelledby="chat-users-title">
+    <div class="chat-section-heading">
+      <h2 id="chat-users-title">Connected Chat Users</h2>
+      <span class="console-caption">Live rate warnings and blocks</span>
+    </div>
+    <div class="console-table" tabindex="0" role="region" aria-label="Connected chat users">
+      <table class="chat-users">
+        <thead><tr><th scope="col">Username</th><th scope="col">Client IP</th><th scope="col">Status</th><th scope="col">Messages</th><th scope="col">Msg/sec</th><th scope="col">Risk</th><th scope="col">Action</th></tr></thead>
+        <tbody id="userRows"></tbody>
+      </table>
+    </div>
+  </section>
+  <section class="console-card chat-recent-card" aria-labelledby="chat-events-title">
+    <h2 id="chat-events-title">Recent Security Events</h2>
+    <ol class="chat-events" id="chat-events"></ol>
+  </section>
+  <section class="console-card" id="blockedUsers" aria-labelledby="chat-blocked-title">
+    <h2 id="chat-blocked-title">Blocked Accounts</h2>
+    <ul class="console-list chat-blocked" id="chat-blocked"></ul>
+    <p class="console-caption" id="chat-operator" hidden><a href="/dashboard/settings#operator">Sign in as an operator</a> to unblock accounts.</p>
+    <p class="console-caption" id="chat-feedback" role="status"></p>
+  </section>
+</div>
+<details class="console-card" id="chat-advanced">
+  <summary>Advanced Details</summary>
+  <p class="console-caption">Most recent 50 moderation events retained by this server session.</p>
+  <ol class="chat-events" id="chat-log"></ol>
+</details>
+<dialog id="chat-details" class="console-card" aria-labelledby="chat-details-title">
+  <header class="chat-section-heading">
+    <h2 id="chat-details-title"></h2>
+    <form method="dialog"><button class="console-button">Close</button></form>
+  </header>
+  <dl id="chat-user-details" class="console-facts"></dl>
+  <h3>Recent moderation</h3>
+  <ol id="chat-user-events" class="chat-events"></ol>
+</dialog>

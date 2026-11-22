@@ -4,18 +4,23 @@
   const $=id=>document.getElementById(id);
   let csrf='', authenticated=false, local=false;
   const channel=typeof BroadcastChannel==='undefined'?null:new BroadcastChannel('sentinel-auth');
-  const state={canView:false,authenticated:false,local:false,ready:null,fetch:apiFetch};
+  const state={canView:false,authenticated:false,local:false,remoteConsole:false,ready:null,fetch:apiFetch};
   window.SentinelAuth=state;
   function apply(data) {
     authenticated=!!data.authenticated; local=!!data.local;
-    Object.assign(state,{authenticated,local,canView:local||authenticated});
+    const remoteConsole=data.remote_console ?? state.remoteConsole;
+    Object.assign(state,{authenticated,local,remoteConsole,canView:local||authenticated});
     document.body.classList.toggle('sentinel-locked',!state.canView);
-    $('sentinel-logout').disabled=!authenticated;
-    $('sentinel-auth-status').textContent=authenticated ? 'Authenticated · expires at '+new Date(Date.now()+data.expires_in*1000).toLocaleTimeString() :
+    const logout=$('sentinel-logout'),status=$('sentinel-auth-status');
+    if(logout) logout.disabled=!authenticated;
+    if(status) status.textContent=authenticated ? 'Authenticated · expires at '+new Date(Date.now()+data.expires_in*1000).toLocaleTimeString() :
       local ? 'Local viewing active. Authenticate before using administrator controls.' :
       data.remote_enabled ? 'Authenticate to view telemetry or use administrator controls.' :
       'Remote administration is disabled on the host.';
     window.dispatchEvent(new CustomEvent('sentinel-auth-changed',{detail:{authenticated,local,canView:state.canView}}));
+    if(remoteConsole && !authenticated && (location.pathname === '/attack-lab' || location.pathname.startsWith('/dashboard'))) {
+      location.replace('/operator/sign-in?' + new URLSearchParams({next:location.pathname+location.search}));
+    }
   }
   async function apiFetch(url,options={}) {
     if(typeof url!=='string'||!url.startsWith('/api/'))throw new Error('Same-origin API path required');
@@ -33,10 +38,11 @@
       csrf=response.headers.get('X-CSRF-Token')||'';
       apply(await response.json());
     } catch(error) {
-      $('sentinel-auth-status').textContent='Session unavailable: '+error.message+' · use Authenticate to retry.';
+      const status=$('sentinel-auth-status');
+      if(status) status.textContent='Session unavailable: '+error.message+' · use Authenticate to retry.';
     }
   }
-  $('sentinel-login').addEventListener('click',async()=>{
+  $('sentinel-login')?.addEventListener('click',async()=>{
     const button=$('sentinel-login');button.disabled=true;
     try {
       const response=await apiFetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -49,7 +55,7 @@
       if(channel)channel.postMessage('session-changed');
     } catch(error){$('sentinel-auth-status').textContent=error.message;} finally {button.disabled=false;}
   });
-  $('sentinel-logout').addEventListener('click',async()=>{
+  $('sentinel-logout')?.addEventListener('click',async()=>{
     try {
       const response=await apiFetch('/api/auth/logout',{method:'POST',signal:AbortSignal.timeout(5000)});
       if(!response.ok)throw new Error('Sign out HTTP '+response.status);

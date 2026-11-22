@@ -1,8 +1,15 @@
+from pathlib import Path
+
 import pandas as pd
+import pytest
 from backend.network.gatv2_inference import gatv2_engine
 
+DATASET = Path(__file__).resolve().parents[1] / "data" / "cleaned_dataset.csv"
+
+
+@pytest.mark.skipif(not DATASET.exists(), reason="optional offline GATv2 evaluation requires data/cleaned_dataset.csv")
 def test_mixed():
-    df = pd.read_csv("data/cleaned_dataset.csv")
+    df = pd.read_csv(DATASET)
     sample_benign = df[df["Label"] == 0].sample(5, random_state=42)
     sample_attack = df[df["Label"] == 1].sample(5, random_state=42)
     combined = pd.concat([sample_benign, sample_attack]).reset_index(drop=True)

@@ -169,6 +169,7 @@ class NetworkRuntime:
             prediction = "ATTACK" if anomaly else "BENIGN"
             confidence = float(result["confidence"]) / 100.0
             flow.update({"gatv2_status": "analyzed", "gatv2_prediction": prediction,
+                         "gatv2_analyzed_at": time.time(),
                          "gatv2_confidence": confidence, "gatv2_anomaly_probability": result["anomaly_probability"],
                          "gatv2_threshold": result["threshold"],
                          "graph_nodes": result["graph_nodes"], "graph_edges": result["graph_edges"]})

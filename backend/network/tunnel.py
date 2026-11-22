@@ -124,6 +124,8 @@ class TunnelManager:
 
     @property
     def local_ip(self) -> str:
+        if os.getenv("SENTINEL_LOOPBACK_ONLY") == "true":
+            return "127.0.0.1"
         now = time.monotonic()
         if self._local_ip_cache and now - self._local_ip_checked < 10:
             return self._local_ip_cache
