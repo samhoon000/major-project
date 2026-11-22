@@ -15,13 +15,14 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, Response
 from fastapi import HTTPException
+from backend.chat_monitoring import ChatMonitoring
 from backend.security.blocking import blocking_manager
 from backend.security.live_behavior_analyzer import BehaviorAnalyzer, BehaviorConfig
 from backend.security.message_analyzer import message_analyzer
 from backend.security.url_analyzer import url_analyzer
 from backend.security.threat_engine import threat_engine
 import ipaddress
-from backend.security.demo_access import boundary, demo_security, public_origin
+from backend.security.demo_access import boundary, demo_security, is_remote_operator_console, public_origin
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -230,6 +231,7 @@ class ChatState:
         self.block_reasons: dict[str, str] = {}
         self.recent: deque[dict[str, Any]] = deque(maxlen=200)
         self.events: deque[dict[str, Any]] = deque(maxlen=500)
+        self.monitoring = ChatMonitoring()
         self.sent: dict[str, deque[tuple[float, str, str]]] = defaultdict(deque)
         self.lock = asyncio.Lock()
 
@@ -256,8 +258,10 @@ class ChatState:
         return matches[0] if len(matches) == 1 else None
 
     async def event(self, kind: str, data: dict[str, Any]) -> None:
-        item = {"type": kind, "timestamp": time.time(), **data}
+        timestamp = time.time()
+        item = {"type": kind, "timestamp": timestamp, **data}
         self.events.append(item)
+        self.monitoring.record(kind, data, timestamp)
         await self.broadcast_dashboard(item)
 
     async def broadcast_dashboard(self, item: dict[str, Any]) -> None:
@@ -1402,6 +1406,7 @@ CHAT_HTML = r"""<!doctype html>
     <div class="header-actions">
       <button type="button" class="nav-btn" id="openInviteBtn" title="Show Joining QR Code &amp; URL">⌁ Invite / QR</button>
       <a href="/dashboard" class="nav-link" target="_blank" rel="noopener">SOC Dashboard</a>
+      <a href="/dashboard/chat-security" class="nav-link" target="_blank" rel="noopener">Chat Security</a>
       <div id="userPill" class="user-pill">
         <span class="status-dot"></span>
         <span id="currentUsername" style="font-weight: 600;"></span>
@@ -1935,10 +1940,18 @@ async def chat_page() -> str:
 
 
 @router.get("/dashboard", response_class=HTMLResponse)
-async def dashboard_page() -> str:
+async def dashboard_page(request: Request):
+    if request.query_params.get("view") != "legacy":
+        from backend.console import page
+        return page(request, "overview")
     from backend.http_flood_ui import http_flood_panel
     from backend.security_ui import security_panel
-    return DASHBOARD_HTML.replace("</header>", "</header>" + security_panel() + http_flood_panel(), 1)
+    applications = (
+        '<section class="panel"><h2 class="panel-title">'
+        '<a href="/dashboard/applications">Monitored Applications</a></h2></section>'
+    )
+    links = '<p><a href="/dashboard">Overview</a> · <a href="/dashboard/chat">Chat Security</a></p>'
+    return DASHBOARD_HTML.replace("</header>", "</header>" + links + security_panel() + applications + http_flood_panel(), 1)
 
 
 
@@ -1976,7 +1989,8 @@ def tunnel_qr_svg() -> Response:
 
 @router.websocket("/ws/dashboard")
 async def dashboard_socket(ws: WebSocket) -> None:
-    if not demo_security.can_view(ws):
+    monitor = ws.query_params.get("view") == "chat-security"
+    if not demo_security.can_view(ws) or (is_remote_operator_console(ws) and not monitor):
         await ws.close(code=1008)
         return
     origin = ws.headers.get("origin")
@@ -1986,6 +2000,9 @@ async def dashboard_socket(ws: WebSocket) -> None:
         await ws.close(code=1008)
         return
     await ws.accept()
+    if monitor:
+        await chat_monitor_socket(ws)
+        return
     dashboard_clients.add(ws)
     try:
         await ws.send_json({"type": "snapshot", **state.dashboard_roster(), "events": list(state.events)})
@@ -1999,6 +2016,52 @@ async def dashboard_socket(ws: WebSocket) -> None:
         pass
     finally:
         dashboard_clients.discard(ws)
+
+
+async def chat_monitor_socket(ws: WebSocket) -> None:
+    """Use the dashboard's authenticated socket without streaming private messages."""
+    try:
+        while demo_security.can_view(ws):
+            await ws.send_json(chat_monitor_snapshot())
+            try:
+                message = await asyncio.wait_for(ws.receive(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            if message["type"] == "websocket.disconnect":
+                return
+            # This stream is read-only.
+            break
+        await ws.close(code=1008)
+    except WebSocketDisconnect:
+        pass
+
+
+def chat_monitor_snapshot() -> dict[str, Any]:
+    telemetry = state.monitoring.snapshot()
+    behavior = behavior_analyzer.snapshot()
+    users = []
+    for username in sorted(state.clients, key=str.casefold):
+        ip = state.client_ips.get(username)
+        block_message = state.chat_block_message(username, ip)
+        details = behavior.get(username, {})
+        users.append({
+            "username": username, "client_ip": ip,
+            "messages": details.get("total_messages", 0),
+            "rate": details.get("messages_per_second", 0),
+            "block_reason": block_message,
+            "warning": not block_message and details.get("risk") in {"SUSPICIOUS", "BLOCK"},
+        })
+
+    blocked = [
+        {"username": name, "reason": state.block_reasons.get(name),
+         "messages": behavior.get(name, {}).get("total_messages", 0)}
+        for name in sorted(state.blocked, key=str.casefold)
+    ]
+    return {
+        "type": "chat_security", **telemetry, "users": users, "blocked": blocked,
+        "rate": telemetry["samples"][-1][0],
+        "suspicious": sum(user["warning"] for user in users),
+    }
 
 
 
@@ -2138,7 +2201,8 @@ async def chat_socket(ws: WebSocket, username: str) -> None:
                 state.block_reasons[username] = decision["reason"]
                 await ws.send_json({"type": "blocked", "message": state.chat_block_message(username, client_ip)})
                 await state.event("blocked", {"username": username, "source_ip": client_ip,
-                                               "reason": decision["reason"], "threat": decision})
+                                               "reason": decision["reason"], "threat": decision,
+                                               "message_id": message_id})
                 await state.roster()
                 await ws.close(code=1008)
                 break

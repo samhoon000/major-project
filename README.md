@@ -2,6 +2,10 @@
 
 Sentinel AI is a real-time, unified network security and secure messaging platform. It integrates live packet capture, bidirectional TCP/UDP flow tracking, graph attention network (GATv2) anomaly detection, multi-signal threat evaluation, and an interactive SOC administration dashboard.
 
+For the separate HTTP collector and Monitored Applications dashboard, see [Northfield Stage 1 setup](docs/NORTHFIELD_TELEMETRY.md).
+For alert-only behavioral rules and the signed synthetic demo, see [Stage 2 HTTP detection](docs/HTTP_DETECTION.md).
+For multi-signal proposals and operator safety controls, see [Stage 3 HTTP protection in Shadow Mode](docs/HTTP_PROTECTION.md).
+
 The system is accessible both locally over Wi-Fi (LAN) and globally across the internet via Cloudflare Tunnel, allowing multiple laptops and mobile phones to connect to the **same** FastAPI application and Threat Engine.
 
 See [How to run Sentinel AI](HOW_TO_RUN.md) for setup, Quick Tunnel access, and a summary of changes on this branch.

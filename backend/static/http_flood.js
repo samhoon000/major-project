@@ -88,7 +88,7 @@
     const reached = new Set(state.timeline.map(e => e.type));
     $('hf-phases').replaceChildren(...[
       ['READY',true],['ATTACK RUNNING',state.started_at != null],
-      ['ATTACK DETECTED',state.detected],['MITIGATION ACTIVE',reached.has('HTTP_MITIGATION_ACTIVATED') || state.detected],
+      ['ATTACK DETECTED',state.detected],['MITIGATION ACTIVE',state.blocked || reached.has('HTTP_MITIGATION_ACTIVATED')],
       ['ATTACK STOPPED',state.stopped_at != null],['RECOVERED',state.recovered]
     ].map(([label,done]) => {const span=document.createElement('span');span.textContent=label;span.className=done?'reached':'';return span;}));
     if ($('hf-start')) {

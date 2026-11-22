@@ -38,6 +38,7 @@ ENV/
 # Process & Runtime State
 *.pid
 .sentinel_pid
+/.northfield-local/
 *.log
 nul
 

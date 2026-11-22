@@ -1,0 +1,1013 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Monitored Applications · Sentinel AI</title>
+<style>
+  body { margin: 0; background: #080e0b; color: #e4f0e9; font: 15px system-ui, sans-serif; }
+  main { max-width: 1100px; margin: auto; padding: 24px; }
+  a { color: #91dbad; } h1 { margin: 12px 0; } p { color: #b2c8bb; }
+  select, .alert-button { background: #13201a; color: inherit; border: 1px solid #38594c; padding: 8px; border-radius: 4px; }
+  .alert-button { cursor: pointer; font: inherit; }
+  .alert-button:disabled { opacity: .65; cursor: wait; }
+.remote-monitor .alert-button { display:none; }
+  dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(185px, 1fr)); gap: 12px; }
+  dl div { background: #13201a; border: 1px solid #294337; border-radius: 6px; padding: 12px; }
+  dt { color: #a9c7b5; } dd { margin: 4px 0 0; overflow-wrap: anywhere; }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; text-align: left; }
+  th, td { padding: 10px 8px; border-bottom: 1px solid #294337; }
+  td:nth-child(3), td:last-child { font-family: monospace; }
+  #threat-detection, #http-protection { margin-top: 36px; border-top: 1px solid #38594c; padding-top: 12px; }
+  .alert-filters, .alert-actions { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin: 12px 0; }
+  .alert-filters label { display: grid; gap: 4px; }
+  #alert-detail { margin-top: 18px; padding: 14px; border: 1px solid #38594c; border-radius: 6px; }
+  #alert-detail h3 { margin-top: 0; }
+  #alerts td { font-family: inherit; }
+  .severity { font-weight: 650; }
+  .severity[data-level="low"] { color: #b7dcae; }
+  .severity[data-level="medium"] { color: #ffcf8b; }
+  .severity[data-level="high"], .severity[data-level="critical"] { color: #ffa49b; }
+  #protection-decisions td { font-family: inherit; vertical-align: top; }
+  #protection-policy table { margin-bottom: 16px; }
+  #protection-decisions details { min-width: 210px; max-width: 440px; }
+  #protection-decisions li { overflow-wrap: anywhere; margin: 6px 0; }
+  #showcase-steps { display:grid; grid-template-columns:repeat(auto-fit,minmax(125px,1fr)); gap:8px; padding:0; list-style:none; }
+  #showcase-steps li { padding:12px; border:1px solid #38594c; border-radius:6px; color:#b2c8bb; }
+  #showcase-steps li[aria-current="step"] { background:#193e2c; color:#fff; border-color:#91dbad; font-weight:700; }
+  #showcase-primary button { min-height:44px; font-weight:700; }
+  #showcase-evidence li { margin:6px 0; overflow-wrap:anywhere; }
+  #advanced-mode { margin-top:20px; }
+</style>
+<main>
+  <!-- overview link -->
+  <h1>Monitored Applications</h1>
+  <!-- operator session -->
+  <p id="connection" role="status">Sign in to view application activity.</p>
+  <!-- northfield monitor -->
+  <section id="showcase-defense" hidden>
+    <h2>Showcase Mode</h2>
+    <ol id="showcase-steps" aria-label="Defense timeline">
+      <li aria-current="step">Normal</li><li>Threat Detected</li><li>Blocked</li><li>Recovered</li>
+    </ol>
+    <div id="showcase-primary" class="alert-actions">
+      <button type="button" class="alert-button" data-primary="simulate">Simulate Threat</button>
+      <button type="button" class="alert-button" data-primary="block" disabled>Block Threat</button>
+      <button type="button" class="alert-button" data-primary="restore" disabled>Restore Access</button>
+    </div>
+    <p id="showcase-headline" role="status">Student access is open.</p>
+    <details><summary>Technical Evidence</summary><ul id="showcase-evidence"></ul></details>
+    <p><button type="button" class="alert-button" id="showcase-reset">Reset Demo</button></p>
+  </section>
+  <details id="advanced-mode" open>
+    <summary>Advanced Mode</summary>
+    <section id="showcase-advanced" hidden>
+    <h2>Manual Defense Controls</h2>
+    <div class="alert-actions">
+      <button type="button" class="alert-button" data-showcase="generate">Generate Test Requests</button>
+      <button type="button" class="alert-button" data-showcase="prepare">Use First Allowance</button>
+      <button type="button" class="alert-button" data-showcase="blocking">Verify Blocking</button>
+      <button type="button" class="alert-button" data-showcase="recovery">Verify Recovery</button>
+      <button type="button" class="alert-button" data-showcase="reset">Reset Demo</button>
+    </div>
+    <p id="showcase-result" role="status"></p>
+    </section>
+  <section id="activity" hidden>
+    <label for="application">Application</label>
+    <select id="application"></select>
+    <dl id="metrics"></dl>
+    <details>
+      <summary>Compare signed request responses</summary>
+      <p>Paste the request ID shown in each student's Northfield course page.</p>
+      <div class="alert-actions">
+        <label>Student 1 request ID <input id="compare-first" maxlength="36" autocomplete="off"></label>
+        <label>Student 2 request ID <input id="compare-second" maxlength="36" autocomplete="off"></label>
+        <button type="button" class="alert-button" id="compare-clear">Clear comparison</button>
+      </div>
+      <p id="compare-scope" role="status"></p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Student 1 observed response</th><th>Student 2 observed response</th></tr></thead>
+          <tbody><tr><td id="compare-first-result"></td><td id="compare-second-result"></td></tr></tbody>
+        </table>
+      </div>
+    </details>
+    <h2>Recent requests</h2>
+    <p id="empty-requests" hidden>No retained requests for this application.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Time</th><th>Method</th><th>Route template</th><th>Status</th><th>Latency</th><th>Auth outcome</th><th>Request ID</th><th>Client pseudonym</th><th>Mitigation applied</th></tr></thead>
+        <tbody id="requests"></tbody>
+      </table>
+    </div>
+  </section>
+  <section id="threat-detection" hidden aria-labelledby="threat-heading">
+    <h2 id="threat-heading">Threat Detection</h2>
+    <p><strong>Detection Mode: Alert Only</strong></p>
+    <dl id="detection-overview"></dl>
+    <h3>Detection health</h3>
+    <dl id="detection-health"></dl>
+    <h3>Recent suspicious activity</h3>
+    <div class="alert-filters" id="alert-filters">
+      <label>Application <select id="alert-app"><option value="">All applications</option></select></label>
+      <label>Severity <select id="alert-severity">
+        <option value="">All severities</option><option value="info">Info</option><option value="low">Low</option>
+        <option value="medium">Medium</option><option value="high">High</option><option value="critical">Critical</option>
+      </select></label>
+      <label>Rule <select id="alert-rule"><option value="">All rules</option></select></label>
+      <label>Status <select id="alert-status">
+        <option value="">All statuses</option><option value="open">Open</option>
+        <option value="acknowledged">Acknowledged</option><option value="resolved">Resolved</option>
+        <option value="false_positive">False positive</option>
+      </select></label>
+    </div>
+    <p id="empty-alerts" hidden>No alerts match these filters.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Last seen</th><th>Application</th><th>Severity</th><th>Category</th><th>Route</th><th>Evidence</th><th>Status</th></tr></thead>
+        <tbody id="alerts"></tbody>
+      </table>
+    </div>
+    <p id="alert-action-result" role="status"></p>
+    <section id="alert-detail" hidden aria-label="Alert details"></section>
+  </section>
+  <section id="http-protection" hidden aria-labelledby="protection-heading">
+    <h2 id="protection-heading">Protection Overview</h2>
+    <p id="protection-mode"></p>
+    <dl id="protection-summary"></dl>
+    <div class="alert-actions" id="protection-controls">
+      <button class="alert-button" data-protection-mode="shadow">Enable Shadow</button>
+      <button class="alert-button" data-protection-mode="alert-only">Use Alert Only</button>
+      <button class="alert-button" data-protection-mode="emergency-disable">Emergency disable</button>
+      <button class="alert-button" data-protection-mode="reset-emergency">Reset emergency switch</button>
+    </div>
+    <p id="protection-feedback" role="status"></p>
+    <h3>Protection Decisions</h3>
+    <p id="empty-protection" hidden>No recorded protection decisions.</p>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Time</th><th>Application</th><th>Decision</th><th>Severity</th><th>Scope</th><th>Reason and evidence</th><th>Expiration</th><th>Enforcement</th></tr></thead>
+        <tbody id="protection-decisions"></tbody>
+      </table>
+    </div>
+    <details id="protection-policy">
+      <summary>Policy Management</summary>
+      <h3>Thresholds and exemptions</h3>
+      <dl id="protection-thresholds"></dl>
+      <ul id="protection-exemptions"></ul>
+      <h3>Recent policy audit</h3>
+      <ul id="protection-audit"></ul>
+    </details>
+    <section id="staging-policies" aria-labelledby="staging-heading">
+      <h3 id="staging-heading">Policy Delivery and Enforcement</h3>
+      <p id="production-policy-status">Production enforcement is disabled.</p>
+      <p id="staging-feedback" role="status"></p>
+      <div id="staging-channels"></div>
+      <h4>Pending policy approvals</h4>
+      <ul id="staging-pending"></ul>
+      <h4>Security event timeline</h4>
+      <ul id="staging-audit"></ul>
+    </section>
+  </section>
+  </details>
+</main>
+<script>
+  const byId = id => document.getElementById(id);
+  const select = byId('application');
+  const connection = byId('connection');
+  const requestedApp = new URLSearchParams(location.search).get('app');
+  let preferredApp = /^[a-z][a-z0-9-]{0,47}$/.test(requestedApp || '') ? requestedApp : '';
+  let socket, retry, streamTimeout, applications = [], detection = null, selectedAlert = null;
+  let comparisonChannels = [];
+  let showcaseSnapshot = null;
+  let previousAlerts = '', previousDetail = '';
+  let previousDecisions = '';
+  let active = true;
+  const localTime = timestamp => new Date(timestamp).toLocaleString();
+
+  function element(tag, value) {
+    const item = document.createElement(tag);
+    item.textContent = value;
+    return item;
+  }
+
+  function cards(id, items) {
+    byId(id).replaceChildren(...items.map(([label, value]) => {
+      const item = document.createElement('div');
+      item.append(element('dt', label), element('dd', value));
+      return item;
+    }));
+  }
+
+  function renderComparison(app) {
+    const channel = comparisonChannels.find(item => item.app === app?.id);
+    const matches = ['first', 'second'].map(side => {
+      const input = byId('compare-' + side);
+      if (!app) input.value = '';
+      const id = input.value.trim().toLowerCase();
+      const event = app?.events.find(item => item.request_id === id && item.subject) ||
+        app?.student_observations?.find(item => item?.request_id === id);
+      const result = byId('compare-' + side + '-result');
+      if (event) {
+        result.replaceChildren(
+          element('strong', 'HTTP ' + event.status),
+          element('div', event.method + ' ' + event.route),
+          element('div', event.request_id),
+          element('div', event.subject),
+          element('div', localTime(event.timestamp))
+        );
+        const receipt = channel?.receipts?.find(item => item.request_id === event.request_id &&
+          ((event.status === 429 && item.outcome === 'rate_limited') ||
+            (event.status === 403 && item.outcome === 'blocked')));
+        const recovery = channel?.recoveries?.find(item => item.request_id === event.request_id &&
+          item.status === event.status && event.status >= 200 && event.status < 300 &&
+          item.subject === event.subject && item.method === event.method && item.route === event.route);
+        if (receipt) result.append(element('div', 'Signed enforcement receipt · Revision ' + receipt.revision));
+        if (recovery) result.append(element('div', 'Verified recovery · Revision ' + recovery.revision));
+      } else {
+        result.textContent = id ? 'Waiting for a match in recent signed observations.' : 'Enter a request ID.';
+      }
+      return event;
+    });
+    const [first, second] = matches;
+    byId('compare-scope').textContent = first && second
+      ? first.method === second.method && first.route === second.route && first.subject !== second.subject
+        ? 'Same method and route template. Two distinct signed student identities.'
+        : 'Choose requests for two different students using the same method and route template.'
+      : '';
+  }
+
+  function render() {
+    const app = applications.find(item => item.id === select.value);
+    byId('activity').hidden = !app;
+    renderComparison(app);
+    if (!app) {
+      byId('metrics').replaceChildren();
+      byId('requests').replaceChildren();
+      return;
+    }
+    const delivery = app.delivery;
+    const metrics = [
+      ['Requests/sec · last 10 seconds', app.requests_per_second],
+      ['Total observed requests', app.total_observed],
+      ['HTTP 429 · last minute', app.statuses[429] || 0],
+      ['Requests · last minute', app.requests_per_minute],
+      ['HTTP statuses · last minute', Object.entries(app.statuses).map(([status, count]) => status + ' × ' + count).join(', ') || '—'],
+      ['Auth failures · last minute', app.auth_failures],
+      ['Mean latency · last minute', app.mean_latency_ms === null ? '—' : app.mean_latency_ms + ' ms'],
+      ['Last request', app.events.length ? localTime(app.events[0].timestamp) : '—'],
+      ['Last delivery', localTime(app.last_seen * 1000)],
+      ['Delivery status', app.status === 'receiving' ? 'Receiving' : 'Stale'],
+      ['Sender queue', delivery.queued],
+      ['Sender counters', [delivery.sent + ' sent', delivery.dropped + ' dropped', delivery.retries + ' retries',
+        delivery.failed_batches + ' failed batches'].join(' · ')]
+    ];
+    cards('metrics', metrics);
+    byId('empty-requests').hidden = app.events.length > 0;
+    byId('requests').replaceChildren(...app.events.map(event => {
+      const row = document.createElement('tr');
+      row.append(...[localTime(event.timestamp), event.method, event.route, event.status, event.duration_ms + ' ms',
+        event.auth.replaceAll('_', ' '), event.request_id, event.subject || '—',
+        event.mitigation_applied == null ? 'Unknown' : event.mitigation_applied ? 'Yes' : 'No']
+        .map(value => element('td', value)));
+      return row;
+    }));
+  }
+
+  function update(snapshot, staging) {
+    const selected = preferredApp || select.value;
+    applications = snapshot;
+    comparisonChannels = staging?.channels || [];
+    select.replaceChildren(...applications.map(app => element('option', app.id)));
+    if (preferredApp || applications.some(app => app.id === selected)) select.value = selected;
+    render();
+  }
+
+  const label = value => value ? value[0].toUpperCase() + value.slice(1).replaceAll('_', ' ') : '—';
+  const time = value => value == null ? '—' : localTime(value);
+  const countLabels = (counts, names = {}) => Object.entries(counts || {})
+    .map(([key, count]) => (names[key] || label(key)) + ' × ' + count).join(', ') || '—';
+
+  function options(id, choices, all) {
+    const input = byId(id);
+    const selected = input.value;
+    if (selected && !Object.hasOwn(choices, selected)) choices = {...choices, [selected]: selected};
+    const entries = [['', all], ...Object.entries(choices)];
+    if (JSON.stringify(entries) === input.dataset.options) return;
+    input.dataset.options = JSON.stringify(entries);
+    input.replaceChildren(...entries.map(([key, title]) => {
+      const option = element('option', title);
+      option.value = key;
+      return option;
+    }));
+    input.value = selected;
+  }
+
+  async function manageAlert(alert, action, button) {
+    button.disabled = true;
+    const feedback = byId('alert-action-result');
+    try {
+      const response = await window.SentinelAuth.fetch('/api/telemetry/alerts/' + encodeURIComponent(alert.id) + '/' + action,
+        {method: 'POST', signal: AbortSignal.timeout(5000)});
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      feedback.textContent = 'Alert ' + label((await response.json()).status).toLowerCase() + '.';
+    } catch (error) {
+      feedback.textContent = 'Could not update the alert. ' + error.message;
+    } finally {
+      if (window.SentinelAuth.authenticated) button.disabled = false;
+    }
+  }
+
+  function renderAlertDetail() {
+    const alert = detection?.alerts?.find(item => item.id === selectedAlert);
+    const detail = byId('alert-detail');
+    if (!alert) {
+      detail.hidden = true;
+      detail.replaceChildren();
+      previousDetail = '';
+      return;
+    }
+    const key = JSON.stringify(alert);
+    if (key === previousDetail) return;
+    previousDetail = key;
+    detail.hidden = false;
+    const evidence = alert.evidence;
+    const ruleName = detection.rules?.[alert.rule] || alert.rule;
+    const facts = [
+      ['Alert ID', alert.id], ['Rule', alert.rule], ['Environment', label(alert.environment)],
+      ['Status', label(alert.status)], ['Scope', alert.app + ' · ' + (evidence.route || 'Application-wide')],
+      ['Evidence quality', label(evidence.quality)], ['Confidence', label(evidence.confidence)],
+      ['Subject attribution', evidence.subject || 'Unavailable'],
+      ['First observed', time(alert.first_seen)], ['Last observed', time(alert.last_seen)],
+      ['Observed / threshold', evidence.observed_count + ' / ' + evidence.threshold],
+      ['Arrival window', evidence.window_seconds + ' seconds']
+    ];
+    if (evidence.sample_size != null) facts.push(
+      ['Sample size / minimum', evidence.sample_size + ' / ' + evidence.minimum_samples],
+      ['Error share / threshold', evidence.observed_percent + '% / ' + evidence.ratio_threshold_percent + '%']
+    );
+    if (evidence.baseline_count != null) facts.push(
+      ['Baseline', evidence.baseline_count + ' requests in ' + evidence.baseline_seconds + ' seconds'],
+      ['Baseline per detection window', evidence.baseline_window_average],
+      ['Required baseline multiple', evidence.ratio_threshold_percent / 100 + '×']
+    );
+    const list = element('dl', '');
+    for (const [term, value] of facts) {
+      const item = element('div', '');
+      item.append(element('dt', term), element('dd', value));
+      list.append(item);
+    }
+    const requests = element('ul', '');
+    for (const request of evidence.requests) {
+      const summary = [request.request_id, request.method + ' ' + request.route, 'HTTP ' + request.status,
+        request.duration_ms + ' ms', label(request.auth), 'sent ' + time(request.timestamp),
+        'received ' + time(request.received_at)].join(' · ');
+      requests.append(element('li', summary));
+    }
+    const actions = element('div', '');
+    actions.className = 'alert-actions';
+    for (const [action, text] of [['acknowledge', 'Acknowledge'], ['resolve', 'Resolve'], ['false-positive', 'Mark false positive']]) {
+      if (!['open', 'acknowledged'].includes(alert.status) || (action === 'acknowledge' && alert.status !== 'open')) continue;
+      const button = element('button', text);
+      button.className = 'alert-button';
+      button.onclick = () => manageAlert(alert, action, button);
+      actions.append(button);
+    }
+    detail.replaceChildren(element('h3', ruleName), element('p', evidence.explanation), list,
+      element('h4', 'Supporting requests (latest ' + evidence.requests.length + ')'), requests, actions);
+  }
+
+  function updateDetection(snapshot) {
+    detection = snapshot;
+    byId('threat-detection').hidden = !snapshot;
+    if (!snapshot) {
+      selectedAlert = null;
+      previousAlerts = '';
+      byId('alerts').replaceChildren();
+      byId('alert-action-result').textContent = '';
+      cards('detection-overview', []);
+      cards('detection-health', []);
+      renderAlertDetail();
+      return;
+    }
+    const overview = snapshot.overview || {};
+    const health = snapshot.health;
+    cards('detection-overview', [
+      ['Total alerts', overview.total ?? '—'], ['Active alerts', overview.active ?? '—'],
+      ['By severity', countLabels(overview.severity)], ['By category', countLabels(overview.rules, snapshot.rules)],
+      ['Applications with active alerts', overview.active_apps?.join(', ') || '—']
+    ]);
+    cards('detection-health', [
+      ['Worker', label(health.status)], ['Events processed', health.processed ?? '—'],
+      ['Pending events', health.pending ?? '—'], ['Oldest pending event', health.lag_ms == null ? '—' : health.lag_ms + ' ms'],
+      ['Last processed', time(health.last_processed)], ['Last request ID', health.last_request_id || '—'],
+      ['Last event processing delay', health.last_event_delay_ms == null ? '—' : health.last_event_delay_ms + ' ms'],
+      ['Processing errors', health.errors ?? '—'], ['Current error', health.last_error || '—']
+    ]);
+    options('alert-app', Object.fromEntries((snapshot.applications || []).map(app => [app, app])), 'All applications');
+    options('alert-rule', snapshot.rules || {}, 'All rules');
+    const alerts = snapshot.alerts || [];
+    byId('empty-alerts').hidden = alerts.length !== 0;
+    const key = JSON.stringify(alerts);
+    if (key !== previousAlerts) {
+      previousAlerts = key;
+      byId('alerts').replaceChildren(...alerts.map(alert => {
+        const row = element('tr', '');
+        const category = element('td', '');
+        const inspect = element('button', snapshot.rules?.[alert.rule] || alert.rule);
+        inspect.className = 'alert-button';
+        inspect.onclick = () => {
+          selectedAlert = alert.id;
+          renderAlertDetail();
+          byId('alert-detail').scrollIntoView({block: 'nearest'});
+        };
+        category.append(inspect);
+        const severity = element('td', label(alert.severity));
+        severity.className = 'severity';
+        severity.dataset.level = alert.severity;
+        row.append(element('td', time(alert.last_seen)), element('td', alert.app), severity, category,
+          element('td', alert.evidence.route || 'Application-wide'),
+          element('td', alert.evidence.observed_count + ' in ' + alert.evidence.window_seconds + ' s'),
+          element('td', label(alert.status)));
+        return row;
+      }));
+    }
+    renderAlertDetail();
+  }
+
+  const decisionLabels = {ALLOW: 'Allow', MONITOR: 'Monitor', RATE_LIMIT: 'Would rate-limit',
+    CHALLENGE: 'Would challenge', BLOCK: 'Would block'};
+
+  async function protectionAction(path, button) {
+    button.disabled = true;
+    const feedback = byId('protection-feedback');
+    try {
+      const response = await window.SentinelAuth.fetch('/api/telemetry/protection/' + path,
+        {method: 'POST', signal: AbortSignal.timeout(5000)});
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      feedback.textContent = 'Protection change saved.';
+    } catch (error) {
+      feedback.textContent = 'Could not save the protection change. ' + error.message;
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  function updateProtection(view) {
+    byId('http-protection').hidden = !view;
+    const table = byId('protection-decisions');
+    if (!view) {
+      previousDecisions = '';
+      table.replaceChildren();
+      byId('protection-feedback').textContent = '';
+      byId('protection-exemptions').replaceChildren();
+      byId('protection-audit').replaceChildren();
+      cards('protection-summary', []);
+      cards('protection-thresholds', []);
+      return;
+    }
+    const shadow = view.mode === 'shadow';
+    byId('protection-mode').textContent = (shadow ? 'Shadow Mode' : 'Alert Only') +
+      (view.emergency ? ' · Emergency switch latched' : '') + ' · Shadow proposals only';
+    const totals = view.totals || {};
+    const health = view.health;
+    cards('protection-summary', [
+      ['Shadow decisions', totals.decisions ?? '—'], ['Proposed blocks', totals.proposed_blocks ?? '—'],
+      ['Proposed rate limits', totals.proposed_limits ?? '—'], ['Enforced blocks', totals.enforced_blocks ?? 0],
+      ['Expired block proposals', totals.expired_block_proposals ?? '—'], ['Policy worker', label(health.status)],
+      ['Alerts evaluated', health.processed ?? '—'], ['Pending alerts', health.pending ?? '—'],
+      ['Evaluation errors', health.errors ?? '—'], ['Last worker heartbeat', time(health.heartbeat)]
+    ]);
+    const controls = byId('protection-controls');
+    controls.hidden = !view.ready;
+    for (const button of controls.querySelectorAll('button')) {
+      const action = button.dataset.protectionMode;
+      button.hidden = (action === 'shadow' && (shadow || view.emergency)) ||
+        (action === 'alert-only' && !shadow) || (action === 'emergency-disable' && view.emergency) ||
+        (action === 'reset-emergency' && !view.emergency);
+      button.onclick = () => protectionAction('mode/' + action, button);
+    }
+    const rows = view.decisions || [];
+    byId('empty-protection').hidden = rows.length > 0;
+    const updated = JSON.stringify(rows);
+    if (updated !== previousDecisions) {
+      previousDecisions = updated;
+      const expanded = new Set([...table.querySelectorAll('details[open]')].map(item => item.dataset.id));
+      table.replaceChildren(...rows.map(decision => {
+        const row = element('tr', '');
+        const evidence = element('td', '');
+        const details = element('details', '');
+        details.dataset.id = decision.id;
+        details.open = expanded.has(decision.id);
+        const summary = element('summary', decision.evidence.signals.map(item => label(item.rule)).join(' · '));
+        const signals = element('ul', '');
+        for (const signal of decision.evidence.signals) {
+          const rate = signal.observed_per_second == null ? '' : ' · ' + signal.observed_per_second +
+            ' requests/s (' + signal.threshold_per_second + ' threshold)';
+          signals.append(element('li', label(signal.rule) + ' · ' + signal.count + ' in ' + signal.window_seconds + 's' + rate +
+            ' · ' + (signal.route || 'Application-wide') + ' · alert ' + signal.alert_id +
+            ' · requests ' + signal.request_ids.join(', ')));
+        }
+        details.append(summary, element('p', decision.reason),
+          element('p', 'Decision ' + decision.id + ' · trigger request ' + (decision.trigger_request_id || '—')),
+          element('p', (decision.evidence.subject ? 'Verified client identity ' + decision.evidence.subject :
+            'Aggregate evidence · No attributable client') + ' · ' +
+            decision.evidence.correlation_window_seconds + 's correlation window'), signals);
+        if (decision.evidence.proposed_requests_per_minute) {
+          details.append(element('p', 'Proposed limit ' + decision.evidence.proposed_requests_per_minute + ' requests/minute'));
+        }
+        if (decision.expires) {
+          details.append(element('p', 'Proposed duration ' + Math.floor((decision.expires - decision.created) / 1000) + 's'));
+        }
+        if (decision.status === 'proposed') {
+          const dismiss = element('button', 'Reject proposal');
+          dismiss.className = 'alert-button';
+          dismiss.onclick = () => protectionAction('decisions/' + encodeURIComponent(decision.id) + '/dismiss', dismiss);
+          details.append(dismiss);
+        }
+        evidence.append(details);
+        row.append(element('td', time(decision.created)), element('td', decision.app),
+          element('td', decisionLabels[decision.action]), element('td', label(decision.severity)),
+          element('td', decision.route ? [decision.evidence.method, decision.route].filter(Boolean).join(' ') : 'Application-wide'), evidence,
+          element('td', time(decision.expires)), element('td', decision.status === 'approved' ? 'Approved · See policy delivery' :
+            (decision.enforced ? 'Enforced' : 'Shadow only') +
+            ' · ' + label(decision.status)));
+        return row;
+      }));
+    }
+    const {applications = {}, ...thresholds} = view.policy || {};
+    cards('protection-thresholds', Object.entries(thresholds).map(([key, value]) => [label(key), value]));
+    byId('protection-exemptions').replaceChildren(
+      element('li', 'Protected routes: ' + (view.protected_routes || []).join(', ')),
+      ...Object.entries(applications).map(([app, policy]) => element('li', app + ' · ' + [
+        policy.allowlisted ? 'Application allowlisted' : '', policy.routes.join(', '), policy.rules.map(label).join(', ')
+      ].filter(Boolean).join(' · ')))
+    );
+    byId('protection-audit').replaceChildren(...(view.audit || []).map(entry =>
+      element('li', time(entry.recorded) + ' · ' + entry.source + ' · ' + label(entry.operation.replaceAll('-', '_')) +
+        ' · ' + Object.entries(entry.details).map(([key, value]) => label(key) + ' ' + value).join(', '))));
+  }
+
+  let stagingState = '';
+  function stagingButton(text, app, action, id, feedback = byId('staging-feedback')) {
+    const button = element('button', text);
+    button.className = 'alert-button';
+    button.onclick = async () => {
+      if (action === 'enable-production' && !window.confirm('Enable delivery of separately approved policies for ' + app + '?')) return;
+      button.disabled = true;
+      const path = [app, action, ...(id ? [id] : [])].map(encodeURIComponent).join('/');
+      try {
+        const response = await window.SentinelAuth.fetch('/api/telemetry/staging-policy/' + path,
+          {method: 'POST', signal: AbortSignal.timeout(5000)});
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        feedback.textContent = 'Published revision ' + (await response.json()).revision + '. Check receiver status for acknowledgment.';
+      } catch (error) {
+        feedback.textContent = 'Policy update failed. ' + error.message;
+      } finally {
+        button.disabled = false;
+      }
+    };
+    return button;
+  }
+
+  function updateStaging(view) {
+    const next = JSON.stringify(view);
+    if (next === stagingState) return;
+    stagingState = next;
+    if (!view) byId('staging-feedback').textContent = '';
+    const channels = byId('staging-channels');
+    const pending = byId('staging-pending');
+    const entries = view?.channels || [];
+    byId('production-policy-status').textContent = entries.some(channel => channel.environment === 'production' && channel.enabled)
+      ? 'Production policy delivery is enabled. Each rule requires approval.' : 'Production enforcement is disabled.';
+    channels.replaceChildren(...entries.map(channel => {
+      const block = element('section', '');
+      block.append(element('h4', channel.app + ' · ' + label(channel.environment)),
+        element('p', (channel.enabled ? (channel.expires * 1000 > Date.now() ?
+          'Policy delivery enabled · Signed snapshot current' : 'Policy delivery enabled · Snapshot expired') : 'Enforcement disabled') +
+          ' · Revision ' + channel.revision + ' · Acknowledgment ' + label(channel.acknowledgment) +
+          ' · Sync ' + label(channel.delivery) + ' · Last sync ' + (channel.last_sync ? time(channel.last_sync * 1000) : '—') +
+          ' · Receiver sync errors ' + channel.receiver_errors),
+        element('p', 'Confirmed blocks ' + (channel.confirmed.blocked || 0) +
+          ' · Confirmed rate limits ' + (channel.confirmed.rate_limited || 0)));
+      const controls = element('div', '');
+      controls.className = 'alert-actions';
+      if (channel.enabled) controls.append(stagingButton('Emergency disable', channel.app, 'disable'));
+      else if (channel.can_enable) controls.append(stagingButton('Enable ' + channel.environment, channel.app,
+        channel.environment === 'production' ? 'enable-production' : 'enable'));
+      if (channel.enabled) controls.append(stagingButton('Publish fresh revision', channel.app, 'refresh'));
+      block.append(controls);
+      const rules = element('ul', '');
+      for (const rule of channel.rules) {
+        const item = element('li', '');
+        const expires = element('time', '');
+        expires.dataset.policyExpiry = rule.expires;
+        const state = rule.expires * 1000 <= Date.now() ? 'Expired' :
+          channel.acknowledgment === 'disabled' ? 'Receiver disabled' :
+          channel.delivery !== 'receiving' ? 'Approved · Receiver stale' :
+          channel.acknowledgment === 'applied' ? 'Enforcement active · Receiver verified' : 'Approved · Awaiting receiver';
+        item.append(document.createTextNode(state + ' · ' + label(rule.action) + ' · ' + rule.method + ' ' + rule.route +
+          ' · ' + rule.subject + ' · '), expires, document.createTextNode(' '),
+          stagingButton('Revoke / unblock', channel.app, 'revoke', rule.id));
+        rules.append(item);
+      }
+      if (!channel.rules.length) rules.append(element('li', 'No approved rules.'));
+      block.append(rules);
+      const actual = element('ul', '');
+      for (const item of channel.receipts.filter(item => item.request_id)) {
+        actual.append(element('li', label(item.outcome) + ' · Revision ' + item.revision + ' · ' +
+          item.request_id + ' · ' + time(item.timestamp * 1000)));
+      }
+      if (actual.children.length) block.append(element('h5', 'Northfield enforcement receipts'), actual);
+      return block;
+    }));
+    if (view && !entries.length) channels.append(element('p', view.unavailable ?
+      'Policy storage unavailable.' : 'No policy channels configured.'));
+    pending.replaceChildren(...(view?.pending || []).map(item => {
+      const row = element('li', '');
+      row.append(document.createTextNode(item.app + ' · ' + label(item.action.toLowerCase()) + ' · ' +
+        item.route + ' · ' + item.subject + ' '));
+      if (entries.some(channel => channel.app === item.app && channel.enabled))
+        row.append(stagingButton('Approve policy', item.app, 'approve', item.id));
+      return row;
+    }));
+    if (view && !pending.children.length) pending.append(element('li', 'No eligible proposals awaiting approval.'));
+    renderExpiry();
+  }
+
+  function updateTimeline(view, detections, protection) {
+    const timeline = (view?.audit || []).map(item => [item.timestamp * 1000,
+      item.app + ' · ' + label(item.operation) + ' · Revision ' + item.revision + (item.target ? ' · ' + item.target : '')]);
+    for (const alert of detections?.alerts || []) {
+      timeline.push([alert.first_seen, alert.app + ' · Detected · ' + (detections.rules?.[alert.rule] || alert.rule) +
+        ' · ' + label(alert.severity) + ' · Alert ' + alert.id]);
+    }
+    for (const decision of protection?.decisions || []) {
+      if (!decision.expires) continue;
+      timeline.push([decision.created, decision.app + ' · Proposed · ' + label(decision.action.toLowerCase()) +
+        ' · ' + (decision.route || 'Application-wide') + ' · Decision ' + decision.id]);
+      if (decision.revoked) timeline.push([decision.revoked, decision.app + ' · Proposal closed · ' + decision.id]);
+    }
+    for (const channel of view?.channels || []) {
+      for (const item of channel.receipts) {
+        timeline.push([item.timestamp * 1000, channel.app + ' · ' +
+          (item.request_id ? label(item.outcome) + ' · Request ' + item.request_id : 'Receiver ' + label(item.outcome)) +
+          ' · Revision ' + item.revision]);
+      }
+      for (const item of channel.recoveries || []) {
+        timeline.push([item.timestamp, channel.app + ' · Recovered · ' + item.method + ' ' + item.route +
+          ' · ' + item.subject + ' · HTTP ' + item.status + ' · Request ' + item.request_id + ' · Revision ' + item.revision]);
+      }
+    }
+    timeline.sort((a, b) => b[0] - a[0]);
+    byId('staging-audit').replaceChildren(...timeline.slice(0, 30)
+      .map(([timestamp, message]) => element('li', time(timestamp) + ' · ' + message)));
+  }
+
+  function renderExpiry() {
+    for (const item of document.querySelectorAll('[data-policy-expiry]')) {
+      const seconds = Math.max(0, item.dataset.policyExpiry - Math.floor(Date.now() / 1000));
+      item.textContent = seconds ? 'Expires in ' + seconds + 's' : 'Expired';
+    }
+  }
+  const expiryTimer = setInterval(renderExpiry, 1000);
+  let renderNorthfield = null;
+  /* northfield monitor */
+
+  function connect() {
+    clearTimeout(retry);
+    if (!active || !window.SentinelAuth?.authenticated || socket) return;
+    clearTimeout(streamTimeout);
+    const filters = new URLSearchParams();
+    if (renderNorthfield) filters.set('view', 'northfield');
+    for (const field of ['app', 'severity', 'rule', 'status']) {
+      const value = byId('alert-' + field).value;
+      if (value) filters.set(field, value);
+    }
+    const suffix = filters.size ? '?' + filters.toString() : '';
+    const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws/monitored-applications' + suffix);
+    socket = ws;
+    const waiting = () => { streamTimeout = setTimeout(() => ws.close(), 12000); };
+    if (renderNorthfield) waiting();
+    ws.onmessage = event => {
+      if (socket !== ws) return;
+      clearTimeout(streamTimeout);
+      if (renderNorthfield) waiting();
+      const data = JSON.parse(event.data);
+      showcaseSnapshot = data.type === 'snapshot' ? data : null;
+      update(data.applications || [], data.staging);
+      updateDetection(data.detection || null);
+      updateProtection(data.protection || null);
+      updateStaging(data.staging || null);
+      updateTimeline(data.staging, data.detection, data.protection);
+      renderNorthfield?.(data);
+      connection.textContent = data.type === 'unavailable' ? 'Telemetry storage unavailable.' :
+        applications.length ? 'Live' : 'Waiting for a collector delivery.';
+    };
+    ws.onclose = () => {
+      if (socket !== ws) return;
+      clearTimeout(streamTimeout);
+      socket = null;
+      showcaseSnapshot = null;
+      update([]);
+      updateDetection(null);
+      updateProtection(null);
+      updateStaging(null);
+      updateTimeline();
+      renderNorthfield?.(null, 'Stream disconnected. Reconnecting…');
+      connection.textContent = 'Activity stream disconnected.';
+      retry = setTimeout(async () => {
+        await window.SentinelAuth.restore();
+        connect();
+      }, 3000);
+    };
+  }
+
+  select.onchange = () => {
+    preferredApp = '';
+    render();
+  };
+  for (const side of ['first', 'second']) {
+    byId('compare-' + side).oninput = () => renderComparison(applications.find(app => app.id === select.value));
+  }
+  const showcasePanel = byId('showcase-defense');
+  const advanced = byId('advanced-mode');
+  const showcaseButtons = [...byId('showcase-advanced').querySelectorAll('button[data-showcase]')];
+  if (showcasePanel.dataset.enabled === 'true' || renderNorthfield) advanced.open = false;
+  if (renderNorthfield) advanced.querySelector('summary').textContent = 'Technical Evidence';
+  let showcaseAction = null;
+  function syncShowcasePanel() {
+    showcasePanel.hidden = showcasePanel.dataset.enabled !== 'true' || !window.SentinelAuth.authenticated;
+    byId('showcase-advanced').hidden = showcasePanel.hidden;
+    if (showcasePanel.hidden) {
+      showcaseAction?.abort();
+      byId('showcase-result').textContent = '';
+      byId('showcase-evidence').replaceChildren();
+      showPhase(0, 'Student access is open.');
+      proposal = blockedId = undefined;
+      renderShowcaseButtons();
+    }
+  }
+  const demoApp = 'northfield-staging';
+  const demoRule = 'showcase_course_access';
+  const primary = [...showcasePanel.querySelectorAll('[data-primary]')];
+  const headline = byId('showcase-headline');
+  let phase = 0, proposal, blockedId, interrupted = false, nextRun = 0, cooldown;
+  const channel = () => showcaseSnapshot?.staging?.channels?.find(item => item.app === demoApp && item.environment === 'staging');
+  const decisions = () => (showcaseSnapshot?.protection?.decisions || [])
+    .filter(item => item.app === demoApp && item.rule === demoRule && item.action === 'RATE_LIMIT');
+  const signed = id => showcaseSnapshot?.applications?.find(app => app.id === demoApp)?.events.find(item => item.request_id === id);
+
+  function evidence(text) { byId('showcase-evidence').append(element('li', text)); }
+
+  function showPhase(value, message) {
+    phase = value;
+    headline.textContent = message;
+    [...byId('showcase-steps').children].forEach((item, index) => {
+      if (index === value) item.setAttribute('aria-current', 'step');
+      else item.removeAttribute('aria-current');
+    });
+  }
+
+  function renderShowcaseButtons() {
+    primary.forEach((button, index) => {
+      button.disabled = Boolean(showcaseAction) || interrupted ||
+        (index === 0 ? ![0, 3].includes(phase) || Date.now() < nextRun : index !== phase);
+    });
+    byId('showcase-reset').disabled = Boolean(showcaseAction);
+  }
+
+  function waitFor(label, match, signal) {
+    return new Promise((resolve, reject) => {
+      const deadline = Date.now() + 15000;
+      let timer;
+      const abort = () => { clearTimeout(timer); reject(signal.reason); };
+      const poll = () => {
+        const result = match();
+        if (result || Date.now() >= deadline) {
+          signal.removeEventListener('abort', abort);
+          if (result) resolve(result);
+          else reject(new Error('Timed out waiting for ' + label + '. Check the live connection and Advanced Mode.'));
+        } else timer = setTimeout(poll, 200);
+      };
+      if (signal.aborted) return abort();
+      signal.addEventListener('abort', abort, {once: true});
+      poll();
+    });
+  }
+
+  async function showcasePost(path, signal) {
+    const response = await window.SentinelAuth.fetch('/api/telemetry/' + path,
+      {method: 'POST', signal: AbortSignal.any([signal, AbortSignal.timeout(12000)])});
+    const body = await response.json();
+    if (!response.ok) throw new Error(typeof body.detail === 'string' ? body.detail : 'Request failed (HTTP ' + response.status + ').');
+    return body;
+  }
+
+  function waitRevision(revision, signal) {
+    return waitFor('Northfield policy acknowledgment', () => {
+      const state = channel();
+      return state?.revision === revision && state.delivery === 'receiving' &&
+        state.acknowledgment === (state.enabled ? 'applied' : 'disabled') && state;
+    }, signal);
+  }
+
+  async function checkRequests(name, statuses, signal) {
+    const body = await showcasePost('showcase/' + name, signal);
+    if (!body.matched || body.requests.length !== statuses.length ||
+        body.requests.some((item, index) => item.status !== statuses[index] || !item.request_id)) {
+      throw new Error('Unexpected Northfield responses: ' + body.requests.map(item => 'HTTP ' + item.status).join(', '));
+    }
+    return body.requests;
+  }
+
+  async function waitSigned(requests, signal) {
+    const events = await waitFor('signed course observations', () => {
+      const found = requests.map(item => signed(item.request_id));
+      return found.every((item, index) => item?.subject && item.status === requests[index].status) && found;
+    }, signal);
+    events.forEach(item => evidence('Signed HTTP ' + item.status + ' · ' + item.request_id + ' · ' + localTime(item.timestamp)));
+    return events;
+  }
+
+  async function revoke(id, signal) {
+    const state = channel();
+    if (state.rules.some(rule => rule.id === id && rule.expires * 1000 > Date.now())) {
+      const {revision} = await showcasePost('staging-policy/' + demoApp + '/revoke/' + encodeURIComponent(id), signal);
+      await waitRevision(revision, signal);
+      evidence('Revocation acknowledged · revision ' + revision);
+    } else await waitRevision(state.revision, signal);
+  }
+
+  async function resetShowcase(signal, preserveEvidence = false) {
+    const state = await waitFor('the staging channel', channel, signal);
+    const owned = new Set(decisions().map(item => item.id));
+    if (proposal) owned.add(proposal.id);
+    for (const rule of state.rules) if (owned.has(rule.id)) await revoke(rule.id, signal);
+    await showcasePost('showcase/reset', signal);
+    proposal = blockedId = undefined;
+    interrupted = false;
+    nextRun = Date.now() + 9000;
+    clearTimeout(cooldown);
+    cooldown = setTimeout(renderShowcaseButtons, 9000);
+    if (!preserveEvidence) byId('showcase-evidence').replaceChildren();
+  }
+
+  async function runShowcase(kind, signal) {
+    if (kind === 'simulate') {
+      byId('showcase-evidence').replaceChildren();
+      showPhase(0, 'Sending three ordinary course requests…');
+      const state = await waitFor('the staging channel', channel, signal);
+      const {revision} = state.enabled ? state : await showcasePost('staging-policy/' + demoApp + '/enable', signal);
+      await waitRevision(revision, signal);
+      const requests = await checkRequests('generate', [204, 204, 204], signal);
+      const observations = await waitSigned(requests, signal);
+      const ids = new Set(requests.map(item => item.request_id));
+      proposal = await waitFor('a new Sentinel proposal', () => decisions().find(item =>
+        item.status === 'proposed' && item.evidence.subject === observations[0].subject &&
+        item.evidence.signals.some(entry => entry.rule === demoRule && entry.request_ids.some(id => ids.has(id))) &&
+        showcaseSnapshot.staging?.pending.some(entry => entry.id === item.id)), signal);
+      evidence('Proposal ' + proposal.id + ' · ' + proposal.reason);
+      showPhase(1, 'Sentinel detected the request pattern and proposed a limit for Student 1.');
+    } else if (kind === 'block') {
+      headline.textContent = 'Approving the proposal and waiting for Northfield…';
+      const {revision} = await showcasePost('staging-policy/' + demoApp + '/approve/' + encodeURIComponent(proposal.id), signal);
+      const state = await waitRevision(revision, signal);
+      if (!state.rules.some(rule => rule.id === proposal.id)) throw new Error('The acknowledged policy does not include this proposal.');
+      evidence('Approval acknowledged · revision ' + revision);
+      await checkRequests('prepare', [204], signal);
+      const requests = await checkRequests('blocking', [429, 204], signal);
+      const [first, second] = await waitSigned(requests, signal);
+      if (first.subject !== proposal.evidence.subject || first.subject === second.subject ||
+          first.route !== second.route || first.method !== second.method) throw new Error('The two signed requests did not match the expected scope.');
+      blockedId = first.request_id;
+      await waitFor('a signed rate-limit receipt', () => channel()?.receipts.some(item =>
+        item.request_id === blockedId && item.rule_id === proposal.id && item.revision === revision &&
+        item.outcome === 'rate_limited'), signal);
+      evidence('Signed enforcement receipt · revision ' + revision + ' · ' + blockedId);
+      showPhase(2, 'Student 1 blocked (HTTP 429). Student 2 still has access (HTTP 204).');
+    } else if (kind === 'restore') {
+      headline.textContent = 'Revoking the limit and verifying Student 1’s access…';
+      await revoke(proposal.id, signal);
+      const requests = await checkRequests('recovery', [204], signal);
+      const [recovered] = await waitSigned(requests, signal);
+      const proof = await waitFor('signed recovery evidence', () => channel()?.recoveries.find(item =>
+        item.request_id === recovered.request_id && item.enforcement_request_id === blockedId &&
+        item.subject === proposal.evidence.subject && item.route === proposal.route && item.status === 204), signal);
+      evidence('Verified recovery · revision ' + proof.revision + ' · ' + proof.request_id);
+      showPhase(3, 'Student 1 regained access (HTTP 204). Recovery verified.');
+      await resetShowcase(signal, true);
+    } else {
+      headline.textContent = 'Resetting this showcase…';
+      await resetShowcase(signal);
+      showPhase(0, 'Demo reset. You can start again after the nine-second cooldown.');
+    }
+  }
+
+  async function handleShowcase(kind) {
+    if (showcaseAction || showcasePanel.hidden) return;
+    const action = new AbortController();
+    showcaseAction = action;
+    advanced.inert = true;
+    renderShowcaseButtons();
+    try {
+      await runShowcase(kind, action.signal);
+    } catch (error) {
+      interrupted = true;
+      if (!showcasePanel.hidden) headline.textContent = error.message + ' Use Reset Demo or Advanced Mode to recover.';
+    } finally {
+      showcaseAction = null;
+      advanced.inert = false;
+      renderShowcaseButtons();
+    }
+  }
+
+  for (const button of primary) button.onclick = () => handleShowcase(button.dataset.primary);
+  byId('showcase-reset').onclick = () => handleShowcase('reset');
+  for (const button of showcaseButtons) {
+    button.onclick = async () => {
+      if (showcaseAction || showcasePanel.hidden) return;
+      const action = new AbortController();
+      showcaseAction = action;
+      renderShowcaseButtons();
+      for (const control of showcaseButtons) control.disabled = true;
+      const result = byId('showcase-result');
+      result.textContent = 'Waiting for Northfield…';
+      try {
+        const response = await window.SentinelAuth.fetch('/api/telemetry/showcase/' + button.dataset.showcase,
+          {method: 'POST', signal: AbortSignal.any([action.signal, AbortSignal.timeout(12000)])});
+        const body = await response.json();
+        if (showcasePanel.hidden) return;
+        if (!response.ok) throw new Error(typeof body.detail === 'string' ? body.detail : 'Showcase action failed.');
+        result.textContent = body.message || [
+          body.matched ? 'Expected HTTP responses observed.' : 'Unexpected HTTP response.',
+          ...body.requests.map(item => 'Student ' + item.student + ' · HTTP ' + item.status +
+            ' · ' + (item.request_id || 'No request ID'))
+        ].join(' · ');
+        if (button.dataset.showcase === 'reset') byId('compare-clear').click();
+        if (['blocking', 'recovery'].includes(button.dataset.showcase)) {
+          for (const item of body.requests) {
+            const field = byId(item.student === 1 ? 'compare-first' : 'compare-second');
+            field.value = item.request_id || '';
+            field.closest('details').open = true;
+            field.dispatchEvent(new Event('input'));
+          }
+        }
+      } catch (error) {
+        if (!showcasePanel.hidden) result.textContent = error.message;
+      } finally {
+        showcaseAction = null;
+        for (const control of showcaseButtons) control.disabled = false;
+        renderShowcaseButtons();
+      }
+    };
+  }
+  window.addEventListener('sentinel-auth-changed', syncShowcasePanel);
+  window.SentinelAuth.ready.then(syncShowcasePanel);
+  byId('compare-clear').onclick = () => {
+    byId('compare-first').value = '';
+    byId('compare-second').value = '';
+    renderComparison(applications.find(app => app.id === select.value));
+  };
+  if (preferredApp) {
+    const option = element('option', preferredApp);
+    byId('alert-app').append(option);
+    byId('alert-app').value = preferredApp;
+  }
+  byId('alert-filters').onchange = () => {
+    selectedAlert = null;
+    renderAlertDetail();
+    const previous = socket;
+    socket = null;
+    showcaseSnapshot = null;
+    previous?.close();
+    connect();
+  };
+  window.addEventListener('sentinel-auth-changed', () => {
+    if (window.SentinelAuth.authenticated) {
+      connect();
+      return;
+    }
+    clearTimeout(retry);
+    clearTimeout(streamTimeout);
+    const previous = socket;
+    socket = null;
+    previous?.close();
+    update([]);
+    updateDetection(null);
+    updateProtection(null);
+    updateStaging(null);
+    updateTimeline();
+    renderNorthfield?.(null, 'Sign in to view Northfield telemetry.');
+    connection.textContent = 'Sign in to view application activity.';
+  });
+  window.SentinelAuth.ready.then(connect);
+  window.addEventListener('pagehide', () => {
+    active = false;
+    clearTimeout(retry);
+    clearTimeout(streamTimeout);
+    clearInterval(expiryTimer);
+    socket?.close();
+  });
+</script>
+</html>

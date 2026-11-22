@@ -107,6 +107,7 @@ ATTACK_LAB_HTML = r"""<!doctype html>
 <main>
   <section class="card" aria-labelledby="title">
     <header><h1 id="title">Network Attack Lab</h1><p class="intro">Authenticated demonstration. HTTP flood requests run only on the host loopback endpoint. Legacy browser tests are available locally.</p></header>
+    <p class="links"><a href="/attack-lab">Attack Lab overview</a></p>
     <div class="state-grid" aria-live="polite">
       <div class="state"><span class="label">Target</span><span class="value" id="target">Resolving…</span></div>
       <div class="state"><span class="label">Capture</span><span class="value pill" id="capture">CHECKING</span></div>
@@ -306,9 +307,48 @@ ATTACK_LAB_HTML = r"""<!doctype html>
 
 
 @router.get("/attack-lab", response_class=HTMLResponse)
-def attack_lab_page() -> str:
+def attack_lab_page(request: Request) -> str:
     from backend.http_flood_ui import http_flood_panel
+    from backend.security.demo_access import boundary, demo_security, is_remote_operator_console
     from backend.security_ui import security_panel
+
+    local = boundary(request).local
+    remote_console = is_remote_operator_console(request) and demo_security.can_view(request)
+    if (local or remote_console) and request.query_params.get("view") != "legacy":
+        from backend.console import wrap_existing
+        document = """<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Attack Lab · Sentinel AI</title>
+<style>
+  body { margin:0; background:#080e0b; color:#edf4ff; font:16px system-ui,sans-serif; }
+  main { max-width:720px; margin:auto; padding:clamp(16px,5vw,48px); }
+  section { background:#101b2b; border:1px solid #324763; border-radius:16px; padding:24px; }
+  h1 { font-size:clamp(2rem,5vw,3rem); margin:12px 0; }
+  h2 { font-size:1.3rem; }
+  p { color:#b7c8de; line-height:1.55; }
+  a { color:#a9d9ff; }
+  nav { display:flex; flex-wrap:wrap; gap:12px 24px; margin-top:24px; }
+</style>
+<main>
+  <h1>Attack Lab</h1>
+  <section aria-labelledby="northfield-target">
+    <h2 id="northfield-target">Northfield Student Portal</h2>
+    <p>Watch signed portal traffic, detection evidence, and policy status in Monitored Applications.</p>
+    <nav aria-label="Lab destinations">
+      <a class="console-link" href="/dashboard/applications?app=northfield-staging">View Live Monitoring</a>
+    </nav>
+    <!-- lab access -->
+  </section>
+</main>
+</html>"""
+        advanced = (
+            '<details class="console-card"><summary>Advanced labs</summary>'
+            '<a href="/attack-lab?view=legacy">Advanced · Legacy HTTP Flood Lab</a></details>'
+            if local else '<p>Advanced lab controls are available from the local console.</p>'
+        )
+        return wrap_existing(request, "lab", document.replace("<!-- lab access -->", advanced))
     return ATTACK_LAB_HTML.replace("</header>", "</header>" + security_panel(), 1).replace("<!-- HTTP_FLOOD_PANEL -->", http_flood_panel(controls=True))
 
 

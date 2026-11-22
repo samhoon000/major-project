@@ -67,6 +67,19 @@ test('WebSocket telemetry renders actual graph values, alerts and availability f
   assert.equal(h.get('hf-stop').disabled,false);
 });
 
+test('Detection alone does not mark mitigation active', async () => {
+  const h = harness();
+  await h.tick();
+  const phase = label => h.get('hf-phases').children.find(item => item.textContent === label);
+  h.telemetry({snapshot_at: 101, detected: true});
+  assert.equal(phase('ATTACK DETECTED').className, 'reached');
+  assert.equal(phase('MITIGATION ACTIVE').className, '');
+  h.telemetry({snapshot_at: 102, detected: true, timeline: [{
+    type: 'HTTP_MITIGATION_ACTIVATED', timestamp: 102, label: 'Policy applied'
+  }]});
+  assert.equal(phase('MITIGATION ACTIVE').className, 'reached');
+});
+
 test('Start, Stop and Reset call protected APIs with actual configuration',async()=>{
   const h=harness();await h.tick();
   h.get('hf-start').click();await h.tick();

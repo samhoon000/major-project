@@ -12,7 +12,7 @@ body.sentinel-locked #http-flood-panel,body.sentinel-locked .panel,body.sentinel
 </style>
 <section class="sentinel-auth" aria-label="Administrator sign-in">
 <strong>Secure demonstration access</strong><p>Remote viewers and controllers authenticate here. Sessions expire after 30 minutes.</p>
-<label>Administrator token <input id="hf-token" type="password" autocomplete="off" placeholder="ADMIN_TOKEN — never saved in this browser"></label>
+<label>Administrator token <input id="hf-token" type="password" autocomplete="off" placeholder="Enter token"></label>
 <button id="sentinel-login" type="button">Authenticate</button><button id="sentinel-logout" type="button" disabled>Sign out</button>
 <p id="sentinel-auth-status" role="status">Checking session…</p>
 </section><script src="/api/auth/ui.js"></script>

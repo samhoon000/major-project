@@ -5,9 +5,9 @@ import threading
 import webbrowser
 import pandas as pd
 import numpy as np
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Header
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 from backend.chat_service import router as chat_router
 from backend.attack_lab import router as attack_lab_router
@@ -16,11 +16,15 @@ from backend.network.tunnel import tunnel_manager
 from backend.security.http_flood import HTTPFloodGuard, http_flood_simulator
 from backend.security.demo_access import DemoExposure, DemoCORSMiddleware, router as auth_router, public_origin
 from backend.config import HOST, PORT
+from backend.telemetry.dashboard import router as telemetry_dashboard_router
+from backend.console import router as console_router
 
 app = FastAPI(title="Network Anomaly Detection API")
 app.include_router(chat_router)
 app.include_router(attack_lab_router)
 app.include_router(auth_router)
+app.include_router(telemetry_dashboard_router)
+app.include_router(console_router)
 
 # Enable CORS for frontend
 app.add_middleware(
@@ -82,7 +86,9 @@ def parse_prediction_output(output: str):
     return details
 
 @app.get("/", response_class=HTMLResponse)
-def home():
+def home(request: Request):
+    if request.query_params.get("view") != "legacy":
+        return RedirectResponse("/dashboard", status_code=307)
     return """
 <!doctype html>
 <html lang="en">

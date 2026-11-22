@@ -1,0 +1,36 @@
+<header class="console-heading">
+  <div><h1>Network Analysis</h1><p>Observed network flows and GATv2 classifications</p></div>
+  <span id="network-connection" class="console-status" role="status">Checking capture</span>
+</header>
+<dl id="network-metrics" class="console-metrics"></dl>
+<div class="console-grid">
+  <section class="console-card">
+    <h2>Live network activity</h2>
+    <p class="console-caption">Packets per second · last minute</p>
+    <svg id="network-chart" class="console-chart" viewBox="0 0 900 215" role="img" aria-label="Packets per second over the last minute"></svg>
+    <p id="network-chart-status" class="console-caption"></p>
+  </section>
+  <section class="console-card">
+    <h2>GATv2 prediction</h2>
+    <p id="network-prediction" role="status">Waiting for network data</p>
+    <dl id="network-model" class="console-facts"></dl>
+  </section>
+</div>
+<section class="console-card">
+  <h2>Observed network topology</h2>
+  <div class="console-key"><span style="--series:#79aadc">Observed flow</span><span style="--series:#ffa2a7">Model anomaly</span></div>
+  <svg id="network-topology" class="console-topology" viewBox="0 0 770 320" role="group" aria-label="Observed flows from sources to destinations"></svg>
+  <p id="network-selection" role="status">Waiting for network data.</p>
+</section>
+<section class="console-card">
+  <h2>Recent model anomalies</h2>
+  <ul id="network-anomalies" class="console-list"></ul>
+</section>
+<details class="console-card">
+  <summary>Advanced Details</summary>
+  <p>Up to 25 captured flows from the current runtime.</p>
+  <div class="console-table">
+    <table><thead><tr><th>Source</th><th>Destination</th><th>Protocol</th><th>Packets</th><th>GATv2</th></tr></thead>
+    <tbody id="network-flows"></tbody></table>
+  </div>
+</details>

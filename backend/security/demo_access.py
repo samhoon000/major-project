@@ -14,16 +14,21 @@ import threading
 import time
 from collections import OrderedDict, deque
 from dataclasses import dataclass
-from urllib.parse import urlsplit
+from html import escape
+from urllib.parse import urlencode, urlsplit
 
 from fastapi import APIRouter, HTTPException, Request
 from starlette.requests import HTTPConnection
-from starlette.responses import JSONResponse, Response, RedirectResponse
+from starlette.responses import HTMLResponse, JSONResponse, Response, RedirectResponse
 from starlette.middleware.cors import CORSMiddleware
 
 COOKIE = "sentinel_admin"
 SESSION_SECONDS = 1800
 router = APIRouter()
+OPERATOR_PAGES = frozenset({
+    "/dashboard", "/dashboard/applications", "/attack-lab", "/dashboard/network",
+    "/dashboard/chat", "/dashboard/chat-security", "/dashboard/settings",
+})
 
 
 def remote_enabled():
@@ -31,7 +36,17 @@ def remote_enabled():
 
 
 def dashboard_remote_enabled():
-    return remote_enabled() or os.getenv("DASHBOARD_REMOTE_ENABLED", "false").lower() in ("1", "true", "yes")
+    return (operator_console_enabled() or remote_enabled()
+            or os.getenv("DASHBOARD_REMOTE_ENABLED", "false").lower() in ("1", "true", "yes"))
+
+
+def operator_console_enabled():
+    return (os.getenv("SENTINEL_REMOTE_CONSOLE", "false").lower() in ("1", "true", "yes")
+            or os.getenv("DASHBOARD_REMOTE_ENABLED", "false").lower() in ("1", "true", "yes"))
+
+
+def is_remote_operator_console(connection):
+    return operator_console_enabled() and boundary(connection).tunnel
 
 
 def public_origin():
@@ -179,6 +194,8 @@ class DemoSecurity:
         self.check_origin(connection, required=not context.local)
         header = connection.headers.get("x-admin-token")
         if header:
+            if is_remote_operator_console(connection):
+                raise HTTPException(403, "Use the operator session")
             self.check_token(connection, header)
             return
         session = self.session(connection)
@@ -213,6 +230,8 @@ class DemoSecurity:
         context = boundary(connection)
         if not context.local and not (context.tunnel and dashboard_remote_enabled()):
             raise HTTPException(403, "Remote administration is not enabled for this HTTPS tunnel")
+        if is_remote_operator_console(connection) and not 16 <= len(os.getenv("ADMIN_TOKEN", "")) <= 256:
+            raise HTTPException(503, "Remote operator sign-in requires a configured administrator token")
         self.check_origin(connection, required=True)
         self.check_token(connection, token)
         value = secrets.token_urlsafe(32)
@@ -258,6 +277,7 @@ async def login(request: Request):
 async def session_state(request: Request):
     record = demo_security.session(request)
     response = JSONResponse(dict(authenticated=bool(record), local=boundary(request).local,
+        remote_console=is_remote_operator_console(request),
         remote_enabled=dashboard_remote_enabled(), expires_in=max(0,int(record["expires"]-demo_security.clock())) if record else 0),
         headers={"Cache-Control":"no-store"})
     if record:
@@ -283,16 +303,52 @@ async def auth_script():
                     media_type="text/javascript")
 
 
+@router.get("/operator/sign-in", include_in_schema=False)
+async def operator_sign_in(request: Request):
+    from backend.security_ui import security_panel
+
+    target = request.query_params.get("next", "/dashboard")
+    if target.partition("?")[0] not in OPERATOR_PAGES:
+        target = "/dashboard"
+    if demo_security.session(request):
+        return RedirectResponse(target, status_code=303, headers={"Cache-Control": "no-store"})
+    html = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sentinel operator sign-in</title></head><body>
+<main id="operator-sign-in" data-next="{escape(target, quote=True)}">
+<h1>Sentinel operator sign-in</h1><p>Sign in to access the Sentinel dashboard.</p>
+{security_panel()}<p><a href="/chat">Open Secure Chat</a></p></main>
+<script>
+function continueToConsole() {{
+  if (window.SentinelAuth.authenticated) {{
+    location.replace(document.getElementById('operator-sign-in').dataset.next);
+  }}
+}}
+window.addEventListener('sentinel-auth-changed', continueToConsole);
+window.SentinelAuth.ready.then(continueToConsole);
+</script></body></html>"""
+    return HTMLResponse(html, headers={"Cache-Control": "no-store", "Content-Security-Policy": "frame-ancestors 'none'"})
+
+
 class DemoExposure:
     """Remote route allowlist and authenticated telemetry; local APIs stay compatible."""
-    PUBLIC = {"/attack-lab", "/dashboard", "/chat", "/api/auth/login", "/api/auth/session",
+    CONSOLE = {"/dashboard/network", "/dashboard/settings", "/dashboard/chat", "/dashboard/chat-security"}
+    PUBLIC = CONSOLE | {"/attack-lab", "/dashboard", "/chat", "/api/auth/login", "/api/auth/session",
               "/api/auth/logout", "/api/auth/ui.js", "/api/attack-lab/http-flood/ui.js"}
     READ = {"/api/chat/state", "/api/network/state", "/api/attack-lab/status",
-            "/api/attack-lab/http-flood/state", "/api/tunnel/state", "/api/tunnel/qr.svg"}
+            "/api/attack-lab/http-flood/state", "/api/attack-lab/http-flood-target",
+            "/api/network/quarantine", "/api/tunnel/state", "/api/tunnel/qr.svg"}
     CONTROL = {"/api/attack-lab/http-flood/"+x for x in ("start","stop","reset","unblock","monitor","authorize")}
-    CHAT_AND_DASHBOARD = {"/", "/chat", "/dashboard", "/api/auth/login", "/api/auth/session",
+    CHAT_AND_DASHBOARD = CONSOLE | {"/", "/chat", "/dashboard", "/dashboard/applications",
+                          "/api/auth/login", "/api/auth/session",
                           "/api/auth/logout", "/api/auth/ui.js", "/api/chat/state", "/api/network/state",
                           "/api/tunnel/state", "/api/tunnel/qr.svg"}
+    OPERATOR_PUBLIC = {"/", "/chat", "/operator/sign-in", "/api/auth/login",
+                       "/api/auth/session", "/api/auth/logout", "/api/auth/ui.js",
+                       "/api/tunnel/state", "/api/tunnel/qr.svg"}
+    OPERATOR_READ = {"/api/network/state", "/api/chat/state", "/api/attack-lab/status",
+                     "/api/attack-lab/http-flood/state", "/api/attack-lab/http-flood-target",
+                     "/api/network/quarantine"}
 
     def __init__(self, app):
         self.app = app
@@ -302,13 +358,14 @@ class DemoExposure:
             await self.app(scope,receive,send)
             return
         upstream_send = send
+        connection = HTTPConnection(scope)
+        remote_console = is_remote_operator_console(connection)
         async def private_send(message):
-            if message["type"] == "http.response.start" and scope.get("path", "").startswith("/api/"):
+            if message["type"] == "http.response.start" and (remote_console or scope.get("path", "").startswith("/api/")):
                 headers = [(key,value) for key,value in message.get("headers", []) if key.lower() != b"cache-control"]
                 message = {**message,"headers":headers+[(b"cache-control",b"no-store")]}
             await upstream_send(message)
         send = private_send
-        connection = HTTPConnection(scope)
         path = scope.get("path", "")
         if boundary(connection).local:
             await self.app(scope,receive,send)
@@ -318,7 +375,17 @@ class DemoExposure:
             return
         response = None
         dashboard_only = dashboard_remote_enabled() and not remote_enabled()
-        if dashboard_only and path not in self.CHAT_AND_DASHBOARD:
+        if remote_console and path in OPERATOR_PAGES:
+            if not demo_security.can_view(connection):
+                target = path + ("?" + connection.url.query if connection.url.query else "")
+                response = RedirectResponse("/operator/sign-in?" + urlencode({"next": target}), status_code=303)
+            elif connection.query_params.get("view") == "legacy":
+                response = RedirectResponse(path, status_code=307)
+        elif remote_console and path == "/":
+            response = RedirectResponse("/dashboard", status_code=307)
+        elif remote_console and path not in self.OPERATOR_PUBLIC | self.OPERATOR_READ | (self.CONTROL if remote_enabled() else set()):
+            response = JSONResponse({"detail": "Not found"}, status_code=404)
+        elif not remote_console and dashboard_only and path not in self.CHAT_AND_DASHBOARD:
             response = JSONResponse({"detail": "Not found"}, status_code=404)
         elif path == "/":
             response = RedirectResponse("/chat" if dashboard_only else "/attack-lab", status_code=307)
@@ -336,7 +403,7 @@ class DemoExposure:
                     readiness_note="Public hostname configured; reachability must be verified separately"))
         elif path in self.READ and not demo_security.can_view(connection):
             response = JSONResponse({"detail":"Authenticate to view sensitive telemetry"},status_code=401)
-        elif path not in self.PUBLIC | self.READ | self.CONTROL:
+        elif not remote_console and path not in self.PUBLIC | self.READ | self.CONTROL:
             response = JSONResponse({"detail":"Not found"},status_code=404)
         if response:
             await response(scope,receive,send)

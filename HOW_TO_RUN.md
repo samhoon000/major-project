@@ -20,6 +20,10 @@ Setup creates a virtual environment, installs dependencies, checks model assets,
 
 For a manual launch after setup, run `.\venv\Scripts\python.exe -m uvicorn app:app --host 127.0.0.1 --port 8001 --no-proxy-headers` from the repository root. Use one server process. The proxy flag lets the app validate the actual connection peer.
 
+The complete Sentinel console is at [http://127.0.0.1:8001/dashboard](http://127.0.0.1:8001/dashboard). Its sidebar opens Overview, Monitored Applications, Attack Lab, Network Analysis, Chat Security, and Settings in that same application. The standard Quick Tunnel setup below points to `app:app` and uses Sentinel's configured remote access rules. Monitored Applications and its Northfield telemetry are available on loopback. Attack Lab availability on a tunnel follows the existing remote demo configuration.
+
+If a URL displays **Not available in the chat preview.**, it belongs to a temporary chat-only test server. Open the complete console URL above for all six modules. For remote chat, use the public joining link reported by the currently running Sentinel application.
+
 ## Part 1 — Publish Sentinel AI with Cloudflare Quick Tunnel
 
 Only the Windows laptop or VM hosting Sentinel needs `cloudflared`. Teammates can join with a browser and internet access. A Quick Tunnel is free for development and provides a temporary HTTPS address without a Cloudflare account or custom domain. [Cloudflare Quick Tunnel docs](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)

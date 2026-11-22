@@ -1,0 +1,23 @@
+<header class="console-heading">
+  <div><h1>Sentinel</h1><p>Real-Time Intrusion Detection &amp; Application Security</p></div>
+  <span id="overview-connection" class="console-status" role="status">Checking connection</span>
+</header>
+<dl id="overview-metrics" class="console-metrics"></dl>
+<section class="console-card" aria-labelledby="activity-heading">
+  <h2 id="activity-heading">Security activity</h2>
+  <p class="console-caption">Application events per 5 minutes · last 30 minutes · retained evidence</p>
+  <div class="console-key"><span style="--series:#f9c37a">Detections</span><span style="--series:#ffa2a7">Confirmed blocks</span></div>
+  <svg class="console-chart" id="overview-chart" viewBox="0 0 900 215" role="img" aria-label="Application detections and confirmed blocks in the last 30 minutes"></svg>
+  <p id="overview-activity" class="console-caption"></p>
+</section>
+<div class="console-grid">
+  <section class="console-card" aria-labelledby="overview-app-heading">
+    <h2 id="overview-app-heading">Northfield Student Portal</h2>
+    <dl class="console-facts" id="overview-app"></dl>
+    <a class="console-link" id="overview-monitor" href="/dashboard/applications">View Monitoring</a>
+  </section>
+  <section class="console-card" aria-labelledby="overview-recent-heading">
+    <h2 id="overview-recent-heading">Recent security events</h2>
+    <ul class="console-list" id="overview-events"></ul>
+  </section>
+</div>

@@ -362,9 +362,13 @@ class TestWebSocketOriginValidation(unittest.TestCase):
         self.assertIn("location.protocol === 'https:' ? 'wss:' : 'ws:'", chat_res.text)
         self.assertIn("/ws/chat/", chat_res.text)
 
-        dash_res = client.get("/dashboard")
+        dash_res = client.get("/dashboard?view=legacy")
         self.assertEqual(dash_res.status_code, 200)
         self.assertIn("(location.protocol==='https:'?'wss':'ws')", dash_res.text)
+        monitor_res = client.get("/dashboard/chat")
+        self.assertEqual(monitor_res.status_code, 200)
+        self.assertIn("location.protocol === 'https:' ? 'wss:' : 'ws:'", monitor_res.text)
+        self.assertIn("/ws/dashboard?view=chat-security", monitor_res.text)
         self.assertIn("/ws/dashboard", dash_res.text)
 
 

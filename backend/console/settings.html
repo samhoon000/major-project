@@ -1,0 +1,34 @@
+<header class="console-heading">
+  <div><h1>Settings</h1><p>Operator access, network capture and connections</p></div>
+  <span id="settings-health" class="console-status" role="status">Checking connection</span>
+</header>
+<section id="operator" class="console-card">
+  <h2>Administrator session</h2>
+  <!-- operator -->
+</section>
+<div class="console-grid">
+  <section class="console-card">
+    <h2>Network capture</h2>
+    <dl class="console-facts" id="capture-settings"></dl>
+  </section>
+  <section class="console-card">
+    <h2>Connectivity</h2>
+    <dl class="console-facts" id="connection-settings"></dl>
+    <div class="console-actions">
+      <button class="console-button" id="settings-copy" disabled>Copy chat link</button>
+      <details id="settings-share">
+        <summary>Joining QR code</summary>
+        <img id="settings-qr" alt="QR code for the active chat joining URL" width="160" height="160">
+      </details>
+    </div>
+    <p id="settings-feedback" role="status"></p>
+  </section>
+</div>
+<details class="console-card">
+  <summary>Advanced diagnostics</summary>
+  <dl class="console-facts" id="diagnostic-settings"></dl>
+  <div class="console-actions">
+    <a href="/dashboard?view=legacy">Legacy Security Dashboard</a>
+    <a id="settings-legacy-graph" href="/?view=legacy">Legacy Dataset Graph</a>
+  </div>
+</details>
