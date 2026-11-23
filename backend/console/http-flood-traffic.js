@@ -1,38 +1,58 @@
 (() => {
   const {id, poll, read} = window.SentinelConsole;
-  const note = id('hf-thresholds');
-  let stream, reconnect, latest = 0, disposed = false;
+  const threshold = id('hf-thresholds');
+  const status = id('hf-traffic-status');
+  let stream, reconnect, latest = 0, lastSocketUpdate = -Infinity, disposed = false;
 
-  function render(state) {
-    if (state.profile !== 'policy-verification' || state.snapshot_at < latest) return;
+  function setStatus(message) {
+    if (status.textContent !== message) status.textContent = message;
+  }
+
+  function render(state, transport) {
+    if (state.type !== 'HTTP_POLICY_TRAFFIC' || state.snapshot_at < latest) return;
     latest = state.snapshot_at;
     window.SentinelHTTPFloodChart(state);
+    id('hf-current-rate').textContent = state.buckets.at(-1).total_rps;
+    id('hf-window-total').textContent = state.totals.total;
+    id('hf-window-accepted').textContent = state.totals.accepted;
+    id('hf-window-blocked').textContent = state.totals.blocked;
     const {block_rps, window_seconds} = state.thresholds;
-    note.textContent = 'Lines show observed arrivals over the last second. The dashed ' +
-      block_rps + ' req/s threshold applies to the test client averaged over ' +
-      window_seconds + ' seconds. Accepted + blocked = total.';
+    const rule = `The dashed ${block_rps} req/s threshold applies to the detector’s rolling ${window_seconds}-second window. ` +
+      'The traffic lines count observed HTTP 200 and 429 responses by arrival second.';
+    if (threshold.textContent !== rule) threshold.textContent = rule;
+    setStatus(transport);
   }
 
   function connect() {
     if (disposed) return;
-    const url = new URL('/ws/dashboard', location.href);
+    const url = new URL('/ws/dashboard?view=http-flood-traffic', location.href);
     url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     stream = new WebSocket(url);
     stream.addEventListener('message', event => {
       try {
         const state = JSON.parse(event.data);
-        if (state.type === 'HTTP_FLOOD_TELEMETRY') render(state);
+        if (state.type !== 'HTTP_POLICY_TRAFFIC') return;
+        render(state, 'Live');
+        lastSocketUpdate = performance.now();
       } catch {
         // Polling supplies the current snapshot if the stream message is invalid.
       }
     });
     stream.addEventListener('close', () => {
-      if (!disposed) reconnect = setTimeout(connect, 3000);
+      lastSocketUpdate = -Infinity;
+      if (!disposed) {
+        setStatus('Reconnecting');
+        reconnect = setTimeout(connect, 3000);
+      }
     });
   }
 
-  poll(async signal => render(await read('/api/attack-lab/verification', signal)), () => {
-    if (stream?.readyState !== WebSocket.OPEN) note.textContent = 'Local lab telemetry unavailable.';
+  const socketFresh = () => performance.now() - lastSocketUpdate < 2500;
+  poll(async signal => {
+    if (socketFresh()) return;
+    render(await read('/api/attack-lab/verification/traffic', signal), 'Live · HTTP fallback');
+  }, () => {
+    if (!socketFresh()) setStatus(latest ? 'Connection interrupted · showing last update' : 'Local lab telemetry unavailable');
   }, 1000);
   window.addEventListener('pagehide', () => {
     disposed = true;

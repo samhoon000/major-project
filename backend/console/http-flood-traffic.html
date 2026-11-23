@@ -3,7 +3,15 @@
     <h2 id="hf-traffic-heading">HTTP Flood Lab traffic</h2>
     <a href="/attack-lab" target="_blank" rel="noopener">Open Attack Lab</a>
   </div>
-  <h3>Observed requests per second</h3><div class="hf-legend"><span style="color:#71ceff">● Total attempts</span><span style="color:#7df1ad">● Accepted</span><span style="color:#ff857b">● Blocked (429)</span><span style="color:#f2c967">– Detection threshold</span></div>
-  <svg id="hf-chart" viewBox="0 0 900 230" role="img" aria-label="Actual total, accepted and blocked HTTP requests per second"></svg>
-  <p class="hf-muted" id="hf-thresholds" role="status">Waiting for local lab telemetry.</p>
+  <dl class="hf-metrics">
+    <div><dt>Current requests/s</dt><dd id="hf-current-rate">—</dd></div>
+    <div><dt>Total attempts · 60 s</dt><dd id="hf-window-total">—</dd></div>
+    <div><dt>Accepted · 60 s</dt><dd id="hf-window-accepted">—</dd></div>
+    <div><dt>Blocked · 60 s</dt><dd id="hf-window-blocked">—</dd></div>
+  </dl>
+  <h3>Observed requests per second</h3>
+  <div class="hf-legend"><span style="color:#71ceff">● Total attempts</span><span style="color:#7df1ad">● Accepted</span><span style="color:#ff857b">● Blocked (429)</span><span style="color:#f2c967">– Detection threshold</span></div>
+  <svg id="hf-chart" viewBox="0 0 900 230" role="img" aria-label="Total, accepted and blocked HTTP requests per second over the last 60 seconds"></svg>
+  <p class="hf-muted" id="hf-thresholds"></p>
+  <p class="hf-muted" id="hf-traffic-status" role="status">Waiting for local lab telemetry</p>
 </section>

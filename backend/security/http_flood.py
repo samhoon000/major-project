@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -20,7 +20,9 @@ log = logging.getLogger(__name__)
 TARGET = "/api/attack-lab/http-flood-target"
 HEADER = "x-sentinel-lab-key"
 METHOD = "Rule-Based HTTP Flood Detection"
-POLICY_CHECK_MAX_REQUESTS = 10
+POLICY_CHECK_MAX_REQUESTS = 25
+POLICY_CHECK_TIMEOUT_MARGIN = 2
+POLICY_TRAFFIC_WINDOW = 60
 
 
 class RunConfig(BaseModel):
@@ -33,8 +35,21 @@ class RunConfig(BaseModel):
 class PolicyCheckConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
     rate: int = Field(default=1, ge=1, le=1, strict=True)
-    duration: int = Field(default=4, ge=1, le=POLICY_CHECK_MAX_REQUESTS, strict=True)
+    request_count: int = Field(default=1, ge=1, le=POLICY_CHECK_MAX_REQUESTS, strict=True)
     concurrency: int = Field(default=1, ge=1, le=1, strict=True)
+    # Older callers supplied a duration to select how many one-second slots to run.
+    duration: int | None = Field(default=None, ge=1, le=10, strict=True)
+
+    @model_validator(mode="after")
+    def check_count_source(self):
+        if "duration" in self.model_fields_set:
+            if self.duration is None or "request_count" in self.model_fields_set:
+                raise ValueError("Supply either a request count or a legacy duration")
+        return self
+
+    @property
+    def selected_count(self):
+        return self.duration if self.duration is not None else self.request_count
 
 
 @dataclass(frozen=True)
@@ -454,47 +469,76 @@ class HTTPPolicyVerification(HTTPFloodSimulator):
 
     def __init__(self):
         self.next_request_at = 0.0
+        # The chart spans runs, so reset only clears the per-run detector state.
+        self.traffic_responses: list[tuple[float, int]] = []
         super().__init__(DetectorConfig(window=4, warning_rps=0.5, block_rps=0.75, block_seconds=8))
 
     def _clear(self):
         super()._clear()
-        self.config = RunConfig(**PolicyCheckConfig().model_dump())
+        self.config = PolicyCheckConfig()
         self.response_latencies = []
         self.outcome = None
 
     def get_state(self):
         snapshot = super().get_state()
+        unused_count_field = "request_count" if self.config.duration is not None else "duration"
+        snapshot["config"].pop(unused_count_field)
         return dict(
             snapshot, profile="policy-verification", outcome=self.outcome,
+            request_count=self.config.selected_count,
             attack_name="Isolated HTTP rate-policy verification",
             limits=dict(max_rate=1, max_requests=POLICY_CHECK_MAX_REQUESTS, max_concurrency=1,
-                        max_duration=POLICY_CHECK_MAX_REQUESTS),
+                        max_duration=POLICY_CHECK_MAX_REQUESTS + POLICY_CHECK_TIMEOUT_MARGIN),
             latency_average_ms=round(sum(self.response_latencies) / len(self.response_latencies), 2)
             if self.response_latencies else None,
         )
+
+    def _prune_traffic(self, now):
+        self.traffic_responses = [(arrived_at, status) for arrived_at, status in self.traffic_responses
+                                  if now - POLICY_TRAFFIC_WINDOW < arrived_at <= now]
+
+    def record_traffic_response(self, arrived_at, status):
+        if status in (200, 429):
+            self.traffic_responses.append((arrived_at, status))
+            self._prune_traffic(self.wall_clock())
+
+    def traffic_snapshot(self):
+        now = self.wall_clock()
+        self._prune_traffic(now)
+        first = math.floor(now - POLICY_TRAFFIC_WINDOW)
+        counts = [[0, 0] for _ in range(POLICY_TRAFFIC_WINDOW + 1)]
+        for arrived_at, status in self.traffic_responses:
+            counts[math.floor(arrived_at) - first][0 if status == 200 else 1] += 1
+        buckets = []
+        for second, (accepted, blocked) in enumerate(counts, start=first):
+            buckets.append(dict(timestamp=second, total_rps=accepted + blocked,
+                                accepted_rps=accepted, blocked_rps=blocked))
+        accepted = sum(bucket["accepted_rps"] for bucket in buckets)
+        blocked = sum(bucket["blocked_rps"] for bucket in buckets)
+        return dict(type="HTTP_POLICY_TRAFFIC", snapshot_at=now, window_seconds=POLICY_TRAFFIC_WINDOW, buckets=buckets,
+                    totals=dict(total=accepted + blocked, accepted=accepted, blocked=blocked),
+                    thresholds=dict(block_rps=self.detector.block_rps, window_seconds=self.detector.window))
 
     async def start_check(self, base_url, config: PolicyCheckConfig | None = None):
         async with self.lock:
             if self._closed or self.started is not None:
                 raise ValueError("Reset the lab before starting another check")
             self.base_url = validate_base_url(base_url)
-            self.config = RunConfig(**(config or PolicyCheckConfig()).model_dump())
+            self.config = config or PolicyCheckConfig()
             self.started, self.status = self.wall_clock(), "attack_running"
             self.task = asyncio.create_task(self._run_check(), name="http-policy-verification")
             self._ensure_publisher()
             return self.get_state()
 
     async def _run_check(self):
+        request_count = self.config.selected_count
+
         async def check_responses():
             async with self._client(1) as client:
                 counts = self.counts["flood"]
-                deadline = max(self.clock(), self.next_request_at) + self.config.duration
-                for _ in range(min(POLICY_CHECK_MAX_REQUESTS, int(self.config.duration))):
+                for _ in range(request_count):
                     await asyncio.sleep(max(0, self.next_request_at - self.clock()))
-                    now = self.clock()
-                    if now >= deadline:
-                        break
-                    self.next_request_at = now + 1
+                    self.next_request_at = self.clock() + 1
                     previous_blocks, previous_errors = counts["blocked"], counts["failed"]
                     await self._request(client, "flood", verify_rejection=True)
                     if counts["failed"] > previous_errors:
@@ -508,7 +552,7 @@ class HTTPPolicyVerification(HTTPFloodSimulator):
 
         try:
             # Allow for the pacing delay from the preceding run and the last response.
-            async with asyncio.timeout(self.config.duration + 2):
+            async with asyncio.timeout(request_count + POLICY_CHECK_TIMEOUT_MARGIN):
                 self.outcome = await check_responses()
         except TimeoutError:
             self.error, self.outcome = "Verification timed out", "error"
@@ -558,13 +602,24 @@ class HTTPFloodGuard:
                 role = controller.role_for_key(request.headers.get(HEADER, ""))
                 if not role:
                     continue
+                target_send = send
+                if isinstance(controller, HTTPPolicyVerification) and role == "flood":
+                    arrived_at = controller.wall_clock()
+
+                    async def record_response(message):
+                        await send(message)
+                        if message["type"] == "http.response.start":
+                            controller.record_traffic_response(arrived_at, message["status"])
+
+                    target_send = record_response
                 if controller.observe(role):
                     response = JSONResponse(
                         {"detail": "Lab source temporarily rate limited", "run_id": controller.run_id},
                         status_code=429, headers={"Retry-After": str(max(1, math.ceil(
                             controller.block_until - controller.clock())))})
-                    break
+                    await response(scope, receive, target_send)
+                    return
                 request.state.http_lab_run_id = controller.run_id
-                await self.app(scope, receive, send)
+                await self.app(scope, receive, target_send)
                 return
         await response(scope, receive, send)
