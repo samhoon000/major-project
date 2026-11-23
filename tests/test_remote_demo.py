@@ -176,8 +176,33 @@ class RemoteAuthTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("access-control-allow-origin",response.headers)
             self.assertEqual(response.status_code,400)
 
+    async def test_chat_only_tunnel_keeps_dashboard_and_admin_routes_local(self):
+        from fastapi.testclient import TestClient
+        from starlette.websockets import WebSocketDisconnect
+
+        with patch.dict(os.environ, {"SENTINEL_CHAT_ONLY_TUNNEL": "true", "DASHBOARD_REMOTE_ENABLED": "true"}):
+            self.assertEqual((await self.client.get("/chat")).status_code, 200)
+            self.assertIsNone((await self.client.get("/api/tunnel/state")).json()["local_ip"])
+            for path in ("/dashboard", "/dashboard/network", "/api/network/state", "/attack-lab"):
+                self.assertEqual((await self.client.get(path)).status_code, 404)
+            self.assertEqual((await self.client.post("/api/auth/login", json={"token": TOKEN})).status_code, 404)
+            client = TestClient(self.app, client=("127.0.0.1", 51000))
+            with self.assertRaises(WebSocketDisconnect):
+                with client.websocket_connect("wss://demo.example/ws/dashboard", headers=EDGE):
+                    pass
+            for _ in range(2):
+                with client.websocket_connect("wss://demo.example/ws/chat/test-visitor", headers=EDGE) as chat:
+                    roster = chat.receive_json()
+                    self.assertEqual(roster["type"], "users")
+                    self.assertIn("test-visitor", roster["users"])
+                local_state = client.get("http://127.0.0.1:8001/api/chat/state").json()
+                self.assertNotIn("test-visitor", local_state["users"])
+            self.assertEqual(client.get("http://127.0.0.1:8001/dashboard").status_code, 200)
+
     async def test_public_connectivity_is_sanitized_and_legacy_attacks_are_private(self):
-        response=await self.client.get("/api/tunnel/state")
+        with patch.object(tunnel_manager, "status", "running"):
+            self.assertEqual((await self.client.get("/chat")).status_code, 200)
+            response=await self.client.get("/api/tunnel/state")
         self.assertEqual(response.status_code,200)
         self.assertIsNone(response.json()["local_ip"])
         self.assertNotIn("events",response.json())

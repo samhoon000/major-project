@@ -31,18 +31,22 @@ OPERATOR_PAGES = frozenset({
 })
 
 
+def chat_only_tunnel():
+    return os.getenv("SENTINEL_CHAT_ONLY_TUNNEL", "false").lower() in ("1", "true", "yes")
+
+
 def remote_enabled():
-    return (not browser_verification_enabled()
+    return (not chat_only_tunnel() and not browser_verification_enabled()
             and os.getenv("HTTP_FLOOD_REMOTE_ENABLED", "false").lower() in ("1", "true", "yes"))
 
 
 def dashboard_remote_enabled():
-    return (operator_console_enabled() or remote_enabled()
+    return not chat_only_tunnel() and (operator_console_enabled() or remote_enabled()
             or os.getenv("DASHBOARD_REMOTE_ENABLED", "false").lower() in ("1", "true", "yes"))
 
 
 def operator_console_enabled():
-    return (os.getenv("SENTINEL_REMOTE_CONSOLE", "false").lower() in ("1", "true", "yes")
+    return not chat_only_tunnel() and (os.getenv("SENTINEL_REMOTE_CONSOLE", "false").lower() in ("1", "true", "yes")
             or os.getenv("DASHBOARD_REMOTE_ENABLED", "false").lower() in ("1", "true", "yes"))
 
 
@@ -357,11 +361,29 @@ class DemoExposure:
                      "/api/attack-lab/verification/traffic"}
     BROWSER_VERIFICATION = {"/api/attack-lab/http-verification/" + command
                             for command in ("start", "request", "stop", "reset")}
+    CHAT_ONLY_READ = {"/chat", "/api/tunnel/state", "/api/tunnel/qr.svg"}
 
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
+        if chat_only_tunnel() and scope["type"] in {"http", "websocket"}:
+            context = boundary(HTTPConnection(scope))
+            if not context.local:
+                path = scope.get("path", "")
+                if scope["type"] == "websocket":
+                    if context.tunnel and path.startswith("/ws/chat/"):
+                        await self.app(scope, receive, send)
+                    else:
+                        await send({"type": "websocket.close", "code": 1008})
+                    return
+                if not context.tunnel or scope["method"] != "GET" or path not in self.CHAT_ONLY_READ | {"/"}:
+                    await JSONResponse({"detail": "Not found"}, status_code=404,
+                                       headers={"Cache-Control": "no-store"})(scope, receive, send)
+                    return
+                if path == "/":
+                    await RedirectResponse("/chat", status_code=307)(scope, receive, send)
+                    return
         if scope["type"] != "http":
             await self.app(scope,receive,send)
             return
@@ -400,18 +422,9 @@ class DemoExposure:
             response = JSONResponse({"detail": "Not found"}, status_code=404)
         elif path == "/":
             response = RedirectResponse("/chat" if dashboard_only else "/attack-lab", status_code=307)
-        elif path in ("/api/tunnel/state", "/api/tunnel/qr.svg") and not demo_security.can_view(connection):
-            # Public chat joining metadata contains no LAN IP, runtime state or logs.
-            origin = public_origin()
-            if not origin:
-                response = JSONResponse({"detail":"Public hostname is not configured"},status_code=503)
-            elif path.endswith(".svg"):
-                from backend.network.qr_generator import generate_qr_svg
-                response = Response(generate_qr_svg(origin+"/chat"),media_type="image/svg+xml")
-            else:
-                response = JSONResponse(dict(public_url=origin,active_joining_url=origin+"/chat",
-                    local_ip=None,local_url=None,status="public_route",joining_mode="public_https",
-                    readiness_note="Public hostname configured; reachability must be verified separately"))
+        elif path in ("/api/tunnel/state", "/api/tunnel/qr.svg"):
+            # The sharing routes select verified links and redact operator diagnostics.
+            pass
         elif path in self.READ and not demo_security.can_view(connection):
             response = JSONResponse({"detail":"Authenticate to view sensitive telemetry"},status_code=401)
         elif not remote_console and path not in self.PUBLIC | self.READ | self.CONTROL:

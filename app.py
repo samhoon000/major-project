@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 from backend.chat_service import router as chat_router
 from backend.attack_lab import router as attack_lab_router
+from backend.network.chat_invitation import chat_invitation
 from backend.network.runtime import network_runtime
 from backend.network.northfield_probe import northfield_probe
 from backend.network.tunnel import tunnel_manager
@@ -44,6 +45,11 @@ async def stop_http_flood_simulation():
     await http_flood_simulator.close()
     await policy_verification.close()
     await northfield_probe.stop()
+
+
+@app.on_event("shutdown")
+async def stop_chat_invitation_probe():
+    await chat_invitation.close()
 
 DATASET_PATH = "data/full_dataset.csv"
 GRAPH_IMG_PATH = "data/network_graph.png"

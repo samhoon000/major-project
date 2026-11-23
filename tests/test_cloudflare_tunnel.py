@@ -174,7 +174,7 @@ class TestCloudflareTunnelManager(unittest.TestCase):
 
 
 class TestQRCodeGenerator(unittest.TestCase):
-    """Verifies pure-Python QR Code Model 2 SVG generation."""
+    """Verifies QR Code Model 2 SVG generation."""
 
     def test_generate_qr_matrix_shapes(self):
         url = "http://192.168.1.5:8001/chat"
@@ -197,6 +197,142 @@ class TestQRCodeGenerator(unittest.TestCase):
         self.assertIn('height="220"', svg)
         self.assertIn("<rect", svg)
         self.assertIn('aria-label="Join QR Code"', svg)
+
+    def test_qr_svg_is_reused_for_an_unchanged_url(self):
+        url = "https://cached-demo.trycloudflare.com/chat"
+        self.assertIs(generate_qr_svg(url), generate_qr_svg(url))
+
+
+class TestChatInvitationHealth(unittest.IsolatedAsyncioTestCase):
+    async def test_keeps_verified_link_through_failures_and_expires_persistent_outage(self):
+        from unittest.mock import AsyncMock
+        from backend.network.chat_invitation import ChatInvitation
+
+        now = 100.0
+        invite = ChatInvitation(clock=lambda: now)
+        url = "https://stable-demo.trycloudflare.com/chat"
+        with patch.object(invite, "public_candidate", return_value=url), \
+                patch.object(invite, "connector_stopped", return_value=False), \
+                patch.object(invite, "verify_public", new_callable=AsyncMock) as probe:
+            probe.return_value = "retry"
+            invite.sync_candidate()
+            invite.confirm_public(url)
+            original = invite.snapshot(allow_lan=False)
+            self.assertEqual(original["sharing_state"], "connected")
+            for now in (110.0, 115.0, 120.0):
+                invite.snapshot(allow_lan=False)
+                await invite.probe_task
+                pending = invite.snapshot(allow_lan=False)
+                self.assertEqual(pending["sharing_state"], "reconnecting")
+                self.assertEqual(pending["qr_url"], original["qr_url"])
+            now = 145.0
+            disconnected = invite.snapshot(allow_lan=False)
+            self.assertEqual(disconnected["sharing_state"], "disconnected")
+            self.assertIsNone(disconnected["qr_url"])
+            await invite.probe_task
+            probe.return_value = "connected"
+            now = 150.0
+            invite.snapshot(allow_lan=False)
+            await invite.probe_task
+            recovered = invite.snapshot(allow_lan=False)
+            self.assertEqual(recovered["sharing_state"], "connected")
+            self.assertEqual(recovered["qr_url"], original["qr_url"])
+
+    async def test_old_probe_cannot_overwrite_newer_proof_or_start_another_probe(self):
+        import asyncio
+        from backend.network.chat_invitation import ChatInvitation
+
+        now = 100.0
+        invite = ChatInvitation(clock=lambda: now)
+        first = "https://old-demo.trycloudflare.com/chat"
+        second = "https://new-demo.trycloudflare.com/chat"
+        release = asyncio.Event()
+        calls = []
+
+        async def slow_probe(candidate):
+            calls.append(candidate)
+            await release.wait()
+            return "invalid"
+
+        with patch.object(invite, "public_candidate", return_value=first) as current, \
+                patch.object(invite, "connector_stopped", return_value=False), \
+                patch.object(invite, "verify_public", slow_probe):
+            invite.sync_candidate()
+            invite.confirm_public(first)
+            now = 110.0
+            invite.snapshot(allow_lan=False)
+            task = invite.probe_task
+            invite.snapshot(allow_lan=False)
+            self.assertIs(invite.probe_task, task)
+            current.return_value = second
+            self.assertEqual(invite.snapshot(allow_lan=False)["active_joining_url"], first)
+            invite.confirm_public(second)
+            release.set()
+            await task
+            self.assertEqual(calls, [first])
+            latest = invite.snapshot(allow_lan=False)
+            self.assertEqual(latest["sharing_state"], "connected")
+            self.assertEqual(latest["active_joining_url"], second)
+
+    async def test_explicit_invalid_response_retires_qr_without_waiting_for_grace(self):
+        from unittest.mock import AsyncMock
+        from backend.network.chat_invitation import ChatInvitation
+
+        now = 100.0
+        invite = ChatInvitation(clock=lambda: now)
+        url = "https://gone-demo.trycloudflare.com/chat"
+        with patch.object(invite, "public_candidate", return_value=url), \
+                patch.object(invite, "connector_stopped", return_value=False), \
+                patch.object(invite, "verify_public", new_callable=AsyncMock, return_value="invalid"):
+            invite.sync_candidate()
+            invite.confirm_public(url)
+            now = 110.0
+            invite.snapshot(allow_lan=False)
+            await invite.probe_task
+            self.assertIsNone(invite.snapshot(allow_lan=False)["qr_url"])
+
+    async def test_late_failure_does_not_discard_new_proof_for_the_same_url(self):
+        import asyncio
+        from backend.network.chat_invitation import ChatInvitation
+
+        now = 100.0
+        invite = ChatInvitation(clock=lambda: now)
+        url = "https://same-host.trycloudflare.com/chat"
+        release = asyncio.Event()
+
+        async def delayed_failure(_):
+            await release.wait()
+            return "invalid"
+
+        with patch.object(invite, "public_candidate", return_value=url), \
+                patch.object(invite, "connector_stopped", return_value=False), \
+                patch.object(invite, "verify_public", delayed_failure):
+            invite.sync_candidate()
+            invite.confirm_public(url)
+            now = 110.0
+            invite.snapshot(allow_lan=False)
+            await asyncio.sleep(0)
+            invite.confirm_public(url)
+            release.set()
+            await invite.probe_task
+            self.assertEqual(invite.snapshot(allow_lan=False)["sharing_state"], "connected")
+
+    async def test_connector_reconnect_retains_qr_and_confirmed_stop_clears_it(self):
+        from backend.network.chat_invitation import ChatInvitation, tunnel_manager
+
+        invite = ChatInvitation(clock=lambda: 100.0)
+        with patch.object(tunnel_manager, "mode", "quick"), patch.object(tunnel_manager, "status", "running"), \
+                patch.object(tunnel_manager, "process", None), \
+                patch.object(tunnel_manager, "public_hostname", "managed-demo.trycloudflare.com"):
+            candidate = invite.sync_candidate()
+            invite.confirm_public(candidate)
+            qr_url = invite.snapshot(allow_lan=False)["qr_url"]
+            tunnel_manager.status = "reconnecting"
+            waiting = invite.snapshot(allow_lan=False)
+            self.assertEqual(waiting["sharing_state"], "reconnecting")
+            self.assertEqual(waiting["qr_url"], qr_url)
+            tunnel_manager.status = "stopped"
+            self.assertIsNone(invite.snapshot(allow_lan=False)["qr_url"])
 
 
 class TestClientIPResolution(unittest.TestCase):
@@ -442,11 +578,51 @@ class TestTunnelEndpoints(unittest.TestCase):
         self.assertNotIn("token", data)
 
     def test_api_tunnel_qr_svg(self):
-        res = self.client.get("/api/tunnel/qr.svg")
-        self.assertEqual(res.status_code, 200)
-        self.assertIn("image/svg+xml", res.headers.get("content-type", ""))
-        self.assertTrue(res.text.startswith("<svg"))
-        self.assertTrue(res.text.endswith("</svg>"))
+        from backend.network.chat_invitation import MAX_UNVERIFIED, ChatInvitation
+
+        now = 100.0
+        invite = ChatInvitation(clock=lambda: now)
+        first = "https://first-tunnel-demo.trycloudflare.com/chat"
+        second = "https://second-tunnel-demo.trycloudflare.com/chat"
+        invite.confirm_public(first)
+        with patch("backend.chat_service.chat_invitation", invite), \
+                patch.object(invite, "public_candidate", return_value=first) as candidate, \
+                patch.object(invite, "schedule_probe"):
+            state = self.client.get("/api/tunnel/state").json()
+            self.assertEqual(state["active_joining_url"], first)
+            self.assertEqual(state["joining_mode"], "public_https")
+            first_qr = self.client.get(state["qr_url"])
+            self.assertEqual(first_qr.status_code, 200)
+            self.assertIn("image/svg+xml", first_qr.headers.get("content-type", ""))
+            self.assertEqual(first_qr.text, generate_qr_svg(first))
+            candidate.return_value = second
+            pending = self.client.get("/api/tunnel/state").json()
+            self.assertEqual(pending["active_joining_url"], first)
+            self.assertEqual(pending["sharing_state"], "reconnecting")
+            self.assertEqual(self.client.get(state["qr_url"]).status_code, 200)
+            invite.confirm_public(second)
+            rotated = self.client.get("/api/tunnel/state").json()
+            self.assertNotEqual(state["qr_url"], rotated["qr_url"])
+            self.assertEqual(self.client.get(state["qr_url"]).status_code, 404)
+            self.assertEqual(self.client.get(rotated["qr_url"]).text, generate_qr_svg(second))
+            now += MAX_UNVERIFIED
+            self.assertIsNone(self.client.get("/api/tunnel/state").json()["active_joining_url"])
+            self.assertEqual(self.client.get(rotated["qr_url"]).status_code, 404)
+
+    def test_lan_qr_requires_a_separate_direct_client(self):
+        from backend.network.chat_invitation import ChatInvitation
+
+        invite = ChatInvitation()
+        with patch("backend.chat_service.chat_invitation", invite), patch.object(invite, "public_candidate", return_value=None):
+            self.assertIsNone(self.client.get("/api/tunnel/state").json()["active_joining_url"])
+            self.assertEqual(self.client.get("/api/tunnel/qr.svg").status_code, 404)
+            lan = TestClient(app, base_url="http://192.168.1.7:8001", client=("192.168.1.8", 50000))
+            self.assertEqual(lan.get("/chat", headers={"X-Forwarded-For": "192.168.1.8"}).status_code, 200)
+            self.assertIsNone(self.client.get("/api/tunnel/state").json()["active_joining_url"])
+            self.assertEqual(lan.get("/chat").status_code, 200)
+            verified = self.client.get("/api/tunnel/state").json()
+            self.assertEqual(verified["active_joining_url"], "http://192.168.1.7:8001/chat")
+            self.assertEqual(verified["joining_mode"], "local_lan")
 
 
 if __name__ == "__main__":

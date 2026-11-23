@@ -16,6 +16,7 @@ from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, Response
 from fastapi import HTTPException
 from backend.chat_monitoring import ChatMonitoring
+from backend.network.chat_invitation import CHAT_INSTANCE_HEADER, chat_invitation
 from backend.security.blocking import blocking_manager
 from backend.security.live_behavior_analyzer import BehaviorAnalyzer, BehaviorConfig
 from backend.security.message_analyzer import message_analyzer
@@ -370,7 +371,7 @@ DASHBOARD_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <section class="panel" style="margin-top:12px"><div class="user-head"><div class="panel-head" style="border:0;margin:0;padding:0"><div><h2 class="panel-title">USER SECURITY</h2><div class="panel-kicker">CONNECTED CHAT USERS</div></div></div><div class="user-actions"><button id="refreshButton" type="button">REFRESH</button></div></div><div class="table-wrap" style="margin-top:12px"><table class="user-table"><thead><tr><th>USERNAME</th><th>CLIENT IP</th><th>STATUS</th><th>MESSAGES</th><th>MSG/SEC</th><th>RISK</th></tr></thead><tbody id="userRows"></tbody></table></div>
 <details id="blockedUsers" hidden style="margin-top:12px"><summary>Manage blocked accounts</summary><div class="table-wrap"><table><thead><tr><th>USERNAME</th><th>BLOCKED IP</th><th>REASON</th><th>ACTION</th></tr></thead><tbody id="blockedUserRows"></tbody></table></div></details></section>
 <section class="panel" style="margin-top:12px"><div class="panel-head"><div><h2 class="panel-title">LIVE NETWORK FLOWS</h2><div class="panel-kicker">CAPTURED FLOW TRACKER RECORDS AND GATv2 RESULTS</div></div><span class="tag" id="flowCount">0 FLOWS</span></div><div class="table-wrap"><table><thead><tr><th>TIME</th><th>SOURCE</th><th>DESTINATION</th><th>PROTO</th><th>PACKETS</th><th>BYTES</th><th>GATv2</th><th>PROBABILITY</th></tr></thead><tbody id="flows"></tbody></table></div></section>
-<section class="panel" style="margin-top:12px"><div class="panel-head"><div><h2 class="panel-title">ACCESS &amp; CONNECTIVITY // CLOUDFLARE TUNNEL &amp; LOCAL LAN</h2><div class="panel-kicker">MULTI-DEVICE JOINING URLS &amp; REAL-TIME QR CODE</div></div><span class="tag" id="tunnelStatusTag">TUNNEL —</span></div><div style="display:flex;gap:20px;align-items:center;flex-wrap:wrap;padding:6px 0"><div style="background:#fff;padding:8px;border-radius:8px;display:inline-block;line-height:0" id="dashboardQrWrap"><img id="dashboardQrImg" src="/api/tunnel/qr.svg" width="120" height="120" alt="Join QR Code" style="display:block"></div><div style="flex:1;min-width:240px;display:grid;gap:8px"><div class="readout-item"><div class="label">ACTIVE JOINING URL (<span id="joiningModeLabel">LOCAL LAN</span>)</div><div class="value" style="font-size:13px;font-weight:600;color:var(--green)" id="activeJoiningUrl">—</div></div><div style="display:flex;gap:16px;flex-wrap:wrap"><div class="readout-item"><div class="label">PUBLIC CLOUDFLARE URL</div><div class="value" id="publicTunnelUrl">—</div></div><div class="readout-item"><div class="label">LOCAL WI-FI (LAN) URL</div><div class="value" id="localLanUrl">—</div></div></div><div class="small" id="tunnelDetailNote" style="color:var(--muted)">Checking tunnel status...</div></div></div></section>
+<section class="panel" style="margin-top:12px"><div class="panel-head"><div><h2 class="panel-title">ACCESS &amp; CONNECTIVITY // CLOUDFLARE TUNNEL &amp; LOCAL LAN</h2><div class="panel-kicker">MULTI-DEVICE JOINING URLS &amp; REAL-TIME QR CODE</div></div><span class="tag" id="tunnelStatusTag">TUNNEL —</span></div><div style="display:flex;gap:20px;align-items:center;flex-wrap:wrap;padding:6px 0"><div style="background:#fff;padding:8px;border-radius:8px;display:inline-block;line-height:0" id="dashboardQrWrap" hidden><img id="dashboardQrImg" width="120" height="120" alt="Join QR Code" style="display:block"></div><div style="flex:1;min-width:240px;display:grid;gap:8px"><div class="readout-item"><div class="label">ACTIVE JOINING URL (<span id="joiningModeLabel">LOCAL LAN</span>)</div><div class="value" style="font-size:13px;font-weight:600;color:var(--green)" id="activeJoiningUrl">—</div></div><div style="display:flex;gap:16px;flex-wrap:wrap"><div class="readout-item"><div class="label">PUBLIC CLOUDFLARE URL</div><div class="value" id="publicTunnelUrl">—</div></div><div class="readout-item"><div class="label">LOCAL WI-FI (LAN) URL</div><div class="value" id="localLanUrl">—</div></div></div><div class="small" id="tunnelDetailNote" style="color:var(--muted)">Checking tunnel status...</div></div></div></section>
 <footer class="footer"><span id="interfaceInfo">CAPTURE INTERFACE: UNKNOWN</span><span>ATTACK CLASSIFICATION IS PROVIDED BY THE EXISTING GATv2 PIPELINE.</span><span id="updatedAt">UPDATED: —</span></footer></main>
 <script>
 const $=id=>document.getElementById(id);const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));let events=[],networkState=null,chatState=null,samples=[],socket=null,dashboardRefreshBusy=false;const sampleLimit=31;function eventKey(x){return [x.timestamp,x.type,x.flow_id,x.message_id,x.username,x.source_ip].join('|')}function mergeEvents(incoming){const map=new Map(events.map(x=>[eventKey(x),x]));(incoming||[]).forEach(x=>{if(x&&x.type)map.set(eventKey(x),x)});events=Array.from(map.values()).sort((a,b)=>(a.timestamp||0)-(b.timestamp||0)).slice(-500)}function attackEvents(){return events.filter(x=>x.type==='gatv2_analysis'&&(x.gatv2_prediction==='ATTACK'||x.prediction==='ATTACK'))}function timeText(ts){return ts?new Date(ts*1000).toLocaleTimeString(): '—'}function formatRate(value){return Number(value||0).toLocaleString(undefined,{maximumFractionDigits:1})}function formatBytes(value){const n=Number(value||0);if(n<1024)return n.toFixed(0)+' B/s';if(n<1048576)return (n/1024).toFixed(1)+' KB/s';return (n/1048576).toFixed(2)+' MB/s'}function privateIp(ip){if(!ip)return false;if(ip==='::1'||ip.indexOf('fc')===0||ip.indexOf('fd')===0)return true;const m=ip.match(/^(\d{1,3})\.(\d{1,3})\./);if(!m)return false;const a=Number(m[1]),b=Number(m[2]);return a===10||a===127||(a===192&&b===168)||(a===172&&b>=16&&b<=31)}function getFlow(id){if(!networkState)return null;return (networkState.completed_flows||[]).find(f=>f.flow_id===id)||null}
@@ -510,7 +511,34 @@ async function unblock(user) {
     alert(error.message);
   }
 }
-async function refresh(){if(window.SentinelAuth&&!window.SentinelAuth.canView)return;if(dashboardRefreshBusy)return;dashboardRefreshBusy=true;const rosterAtStart=rosterVersion;try{const rs=await Promise.all([fetch('/api/chat/state',{cache:'no-store'}),fetch('/api/network/state',{cache:'no-store'}),fetch('/api/tunnel/state',{cache:'no-store'}).catch(()=>({ok:false}))]);if(!rs[0].ok||!rs[1].ok)throw new Error('API returned '+rs[0].status+' / '+rs[1].status);const c=await rs[0].json(),n=await rs[1].json();let t=null;if(rs[2]&&rs[2].ok)try{t=await rs[2].json()}catch(_){}if(window.SentinelAuth&&!window.SentinelAuth.canView)return;chatState=rosterAtStart===rosterVersion?c:{...chatState,behavior:c.behavior};networkState=n;mergeEvents(c.events||[]);$('pps').textContent=formatRate(n.packets_per_second);$('bps').textContent=formatBytes(n.bytes_per_second);$('active').textContent=(n.active_flows||[]).length;$('analyses').textContent=n.gatv2_analyses==null?'—':n.gatv2_analyses;$('anomalies').textContent=n.gatv2_anomalies==null?'—':n.gatv2_anomalies;$('mps').textContent=formatRate(c.messages_per_second);$('newFlows').textContent=events.filter(x=>x.type==='flow_started'&&Date.now()/1000-(x.timestamp||0)<=60).length;$('captureStatus').textContent='Capture: '+(n.capture||'unknown')+' · GATv2: '+(n.gatv2||'unknown')+' · Pending inference flows: '+(n.pending_flows||0)+(n.capture_error?' · '+n.capture_error:'')+(n.gatv2_error?' · '+n.gatv2_error:'');if(t){$('tunnelStatusTag').textContent='TUNNEL '+(t.status||'DISABLED').toUpperCase();$('tunnelStatusTag').className='tag '+(t.status==='running'?'ok':t.status==='error'?'bad':'');$('activeJoiningUrl').textContent=t.active_joining_url||'—';$('joiningModeLabel').textContent=t.joining_mode==='public_https'?'PUBLIC HTTPS':'LOCAL WI-FI';$('publicTunnelUrl').textContent=t.public_url||(t.public_hostname?('CONFIGURED ('+t.public_hostname+' - WAITING)'):'DISABLED / NOT CONFIGURED');$('localLanUrl').textContent=t.local_url||'—';$('tunnelDetailNote').textContent=t.error?t.error:(t.status==='running'?'Cloudflare tunnel connected. Public access active.':'Local LAN access active. Phone and laptop attendees on same Wi-Fi can join.')}$('interfaceInfo').textContent='CAPTURE: '+(n.adapter_name?(n.adapter_name+' ['+(n.adapter_type||'NET')+'] '+(n.local_ip?'('+n.local_ip+') ':'')+'['+(n.selection_mode||'auto')+']'):(n.interface||'NOT SELECTED'))+(t&&t.joining_mode==='public_https'?' · PUBLIC: HTTPS (CLOUDFLARE)':' · LOCAL: LAN ONLY');$('updatedAt').textContent='UPDATED: '+new Date().toLocaleTimeString();renderBanner(n);renderIncident(n);renderTimeline();renderTerminal();renderTopology(n);renderFlows(n);renderUsers(chatState);addSample(n)}catch(e){$('captureStatus').textContent='API UNAVAILABLE: '+e.message;$('liveIndicator').className='live wait';$('liveIndicator').textContent='API ERROR';$('warningBanner').className='banner wait';$('bannerTitle').textContent='LIVE STATE UNAVAILABLE';$('bannerCopy').textContent='Network and security state could not be refreshed.'}finally{dashboardRefreshBusy=false}}
+
+let dashboardInvitation = null, dashboardInviteValidUntil = 0;
+function renderDashboardInvitation(data) {
+  if (data) {
+    dashboardInvitation = data;
+    dashboardInviteValidUntil = Date.now() + data.share_valid_for * 1000;
+  } else if (Date.now() >= dashboardInviteValidUntil) {
+    dashboardInvitation = null;
+  }
+  const invite = dashboardInvitation;
+  const checking = invite?.active_joining_url && (!data || invite.sharing_state === 'reconnecting');
+  const qr = $('dashboardQrImg');
+  $('dashboardQrWrap').hidden = !invite?.qr_url;
+  if (!invite?.qr_url) qr.removeAttribute('src');
+  else if (qr.getAttribute('src') !== invite.qr_url) qr.src = invite.qr_url;
+  $('tunnelStatusTag').textContent = checking ? 'CHECKING CONNECTION' :
+    invite?.active_joining_url ? 'SHARING LINK AVAILABLE' : 'SHARING LINK UNAVAILABLE';
+  $('tunnelStatusTag').className = 'tag' + (checking ? '' : invite?.active_joining_url ? ' ok' : ' bad');
+  $('activeJoiningUrl').textContent = invite?.active_joining_url || 'No verified sharing link';
+  $('joiningModeLabel').textContent = checking ? 'PREVIOUSLY VERIFIED' :
+    invite?.joining_mode === 'public_https' ? 'PUBLIC HTTPS' :
+    invite?.joining_mode === 'local_lan' ? 'VERIFIED LAN' : 'UNAVAILABLE';
+  $('publicTunnelUrl').textContent = data?.public_url || '—';
+  $('localLanUrl').textContent = data?.local_url || '—';
+  $('tunnelDetailNote').textContent = checking ? 'Retaining the previously verified Chat link.' :
+    data?.readiness_note || 'No recently verified sharing link.';
+}
+async function refresh(){if(window.SentinelAuth&&!window.SentinelAuth.canView)return;if(dashboardRefreshBusy)return;dashboardRefreshBusy=true;const rosterAtStart=rosterVersion;try{const rs=await Promise.all([fetch('/api/chat/state',{cache:'no-store'}),fetch('/api/network/state',{cache:'no-store'}),fetch('/api/tunnel/state',{cache:'no-store'}).catch(()=>({ok:false}))]);if(!rs[0].ok||!rs[1].ok)throw new Error('API returned '+rs[0].status+' / '+rs[1].status);const c=await rs[0].json(),n=await rs[1].json();let t=null;if(rs[2]&&rs[2].ok)try{t=await rs[2].json()}catch(_){}if(window.SentinelAuth&&!window.SentinelAuth.canView)return;chatState=rosterAtStart===rosterVersion?c:{...chatState,behavior:c.behavior};networkState=n;mergeEvents(c.events||[]);$('pps').textContent=formatRate(n.packets_per_second);$('bps').textContent=formatBytes(n.bytes_per_second);$('active').textContent=(n.active_flows||[]).length;$('analyses').textContent=n.gatv2_analyses==null?'—':n.gatv2_analyses;$('anomalies').textContent=n.gatv2_anomalies==null?'—':n.gatv2_anomalies;$('mps').textContent=formatRate(c.messages_per_second);$('newFlows').textContent=events.filter(x=>x.type==='flow_started'&&Date.now()/1000-(x.timestamp||0)<=60).length;$('captureStatus').textContent='Capture: '+(n.capture||'unknown')+' · GATv2: '+(n.gatv2||'unknown')+' · Pending inference flows: '+(n.pending_flows||0)+(n.capture_error?' · '+n.capture_error:'')+(n.gatv2_error?' · '+n.gatv2_error:'');renderDashboardInvitation(t);$('interfaceInfo').textContent='CAPTURE: '+(n.adapter_name?(n.adapter_name+' ['+(n.adapter_type||'NET')+'] '+(n.local_ip?'('+n.local_ip+') ':'')+'['+(n.selection_mode||'auto')+']'):(n.interface||'NOT SELECTED'))+(t&&t.joining_mode==='public_https'?' · PUBLIC: HTTPS (CLOUDFLARE)':' · LOCAL: LAN ONLY');$('updatedAt').textContent='UPDATED: '+new Date().toLocaleTimeString();renderBanner(n);renderIncident(n);renderTimeline();renderTerminal();renderTopology(n);renderFlows(n);renderUsers(chatState);addSample(n)}catch(e){$('captureStatus').textContent='API UNAVAILABLE: '+e.message;$('liveIndicator').className='live wait';$('liveIndicator').textContent='API ERROR';$('warningBanner').className='banner wait';$('bannerTitle').textContent='LIVE STATE UNAVAILABLE';$('bannerCopy').textContent='Network and security state could not be refreshed.'}finally{dashboardRefreshBusy=false}}
 let dashboardRetries=0,dashboardTimer=null,dashboardDisposed=false;
 function connectDashboard(){
  if(dashboardDisposed||(window.SentinelAuth&&!window.SentinelAuth.canView)||(socket&&socket.readyState<=1))return;
@@ -819,6 +847,45 @@ CHAT_HTML = r"""<!doctype html>
       margin-top: 2px;
     }
 
+    .unread-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 20px;
+      height: 20px;
+      padding: 0 6px;
+      border-radius: 10px;
+      background: #0d9488;
+      color: #ffffff;
+      font-size: 11px;
+      font-weight: 700;
+      line-height: 1;
+      margin-left: auto;
+      flex-shrink: 0;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+      transition: transform 0.15s ease, background-color 0.15s ease;
+      letter-spacing: -0.2px;
+    }
+
+    .unread-badge.pulse {
+      animation: unread-pulse 0.4s ease-out;
+    }
+
+    @keyframes unread-pulse {
+      0% { transform: scale(1); }
+      50% { transform: scale(1.22); }
+      100% { transform: scale(1); }
+    }
+
+    .user-item.has-unread {
+      background: rgba(15, 118, 110, 0.08);
+    }
+
+    .user-item.has-unread .user-meta-name {
+      color: #ffffff;
+      font-weight: 700;
+    }
+
     .user-empty {
       padding: 32px 16px;
       text-align: center;
@@ -1116,6 +1183,9 @@ CHAT_HTML = r"""<!doctype html>
       border-radius: 18px;
       width: 100%;
       max-width: 440px;
+      max-height: 100%;
+      overflow-y: auto;
+      box-sizing: border-box;
       padding: 32px 28px;
       box-shadow: 0 24px 60px rgba(0, 0, 0, 0.6);
       display: flex;
@@ -1243,8 +1313,13 @@ CHAT_HTML = r"""<!doctype html>
     }
     .qr-code-frame img {
       display: block;
-      width: 120px;
-      height: 120px;
+      width: 160px;
+      height: 160px;
+    }
+    .qr-code-frame[hidden] { display: none; }
+    @media (max-width: 420px) {
+      .qr-join-box { flex-wrap: wrap; }
+      .qr-info { flex-basis: 100%; }
     }
     .qr-info {
       display: flex;
@@ -1486,14 +1561,14 @@ CHAT_HTML = r"""<!doctype html>
       <p>Connect to the multi-user secure chat network. All messages pass through the Threat Engine to prevent malicious URLs, text attacks, and flooding.</p>
       
       <div class="qr-join-box" id="onboardingQrBox">
-        <div class="qr-code-frame">
-          <img id="onboardingQrImg" src="/api/tunnel/qr.svg" width="120" height="120" alt="Join QR Code">
+        <div class="qr-code-frame" hidden>
+          <img id="onboardingQrImg" width="160" height="160" alt="Scan to join Sentinel Secure Chat">
         </div>
         <div class="qr-info">
-          <div class="access-badge lan" id="onboardingAccessBadge">LOCAL WI-FI ONLY (HTTP)</div>
-          <div class="access-url-text" id="onboardingUrlText">Loading join URL...</div>
+          <div class="access-badge" id="onboardingAccessBadge">Checking sharing link</div>
+          <a class="access-url-text" id="onboardingUrlText"></a>
           <div class="access-help">Scan with mobile camera or share link.</div>
-          <button type="button" class="btn-copy-url" id="onboardingCopyBtn" onclick="copyJoinUrl('onboardingUrlText', 'onboardingCopyBtn')">Copy Link</button>
+          <button type="button" class="btn-copy-url" id="onboardingCopyBtn" onclick="copyJoinUrl('onboardingCopyBtn')" disabled>Copy Link</button>
         </div>
       </div>
 
@@ -1517,14 +1592,14 @@ CHAT_HTML = r"""<!doctype html>
       <p>Scan this QR code with any mobile device or copy the URL to join from another laptop or phone.</p>
       
       <div class="qr-join-box">
-        <div class="qr-code-frame">
-          <img id="inviteQrImg" src="/api/tunnel/qr.svg" width="120" height="120" alt="Join QR Code">
+        <div class="qr-code-frame" hidden>
+          <img id="inviteQrImg" width="160" height="160" alt="Scan to join Sentinel Secure Chat">
         </div>
         <div class="qr-info">
-          <div class="access-badge lan" id="inviteAccessBadge">LOCAL WI-FI ONLY (HTTP)</div>
-          <div class="access-url-text" id="inviteUrlText">Loading join URL...</div>
+          <div class="access-badge" id="inviteAccessBadge">Checking sharing link</div>
+          <a class="access-url-text" id="inviteUrlText"></a>
           <div class="access-help">Scan with mobile camera or open in any web browser.</div>
-          <button type="button" class="btn-copy-url" id="inviteCopyBtn" onclick="copyJoinUrl('inviteUrlText', 'inviteCopyBtn')">Copy Link</button>
+          <button type="button" class="btn-copy-url" id="inviteCopyBtn" onclick="copyJoinUrl('inviteCopyBtn')" disabled>Copy Link</button>
         </div>
       </div>
       <button type="button" class="btn-primary" id="closeInviteBtn" style="margin-top:12px;background:var(--bg-panel);border:1px solid var(--border);">Close</button>
@@ -1550,6 +1625,78 @@ CHAT_HTML = r"""<!doctype html>
       let activeRecipient = '';
       let onlineUsers = [];
       const messagesByPeer = new Map(); // peerName -> array of message objects
+      const unreadCounts = new Map(); // peerName -> integer unread count
+      const seenMessageIds = new Set(); // message_id -> deduplication
+      const BASE_DOCUMENT_TITLE = 'Sentinel // Secure Chat';
+
+      function getStorageKey(user) {
+        return 'sentinel_unread_' + encodeURIComponent(user || myName || '');
+      }
+
+      function loadUnreadCounts() {
+        unreadCounts.clear();
+        if (!myName) return;
+        try {
+          const raw = sessionStorage.getItem(getStorageKey(myName));
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            if (parsed && typeof parsed === 'object') {
+              for (const [peer, count] of Object.entries(parsed)) {
+                const n = parseInt(count, 10);
+                if (Number.isFinite(n) && n > 0) {
+                  unreadCounts.set(peer, n);
+                }
+              }
+            }
+          }
+        } catch (_) {}
+      }
+
+      function saveUnreadCounts() {
+        if (!myName) return;
+        try {
+          const obj = {};
+          for (const [peer, count] of unreadCounts.entries()) {
+            if (count > 0) obj[peer] = count;
+          }
+          sessionStorage.setItem(getStorageKey(myName), JSON.stringify(obj));
+        } catch (_) {}
+      }
+
+      function getUnreadCount(peer) {
+        return unreadCounts.get(peer) || 0;
+      }
+
+      function formatUnreadCount(count) {
+        return count > 99 ? '99+' : String(count);
+      }
+
+      function getTotalUnreadCount() {
+        let total = 0;
+        for (const count of unreadCounts.values()) {
+          total += count;
+        }
+        return total;
+      }
+
+      function updateDocumentTitle() {
+        const total = getTotalUnreadCount();
+        if (total > 0) {
+          document.title = `(${formatUnreadCount(total)}) ${BASE_DOCUMENT_TITLE}`;
+        } else {
+          document.title = BASE_DOCUMENT_TITLE;
+        }
+      }
+
+      function markAsRead(peer) {
+        if (!peer) return;
+        if (unreadCounts.has(peer) && unreadCounts.get(peer) > 0) {
+          unreadCounts.set(peer, 0);
+          saveUnreadCounts();
+          updateRosterUI();
+          updateDocumentTitle();
+        }
+      }
 
       // DOM Elements
       const $ = id => document.getElementById(id);
@@ -1642,8 +1789,9 @@ CHAT_HTML = r"""<!doctype html>
       }
 
       // Select conversation partner
-      window.selectRecipient = function(user) {
+      function selectRecipient(user) {
         activeRecipient = user;
+        markAsRead(user);
         recipientTitle.textContent = user;
         recipientStatus.textContent = 'Active now · Direct Secure Channel';
         headerAvatar.style.display = 'flex';
@@ -1666,7 +1814,8 @@ CHAT_HTML = r"""<!doctype html>
         }
 
         updateRosterUI();
-      };
+      }
+      window.selectRecipient = selectRecipient;
 
       function renderFeed() {
         chatFeed.innerHTML = '';
@@ -1714,7 +1863,8 @@ CHAT_HTML = r"""<!doctype html>
 
         filtered.forEach(user => {
           const item = document.createElement('div');
-          item.className = 'user-item' + (user === activeRecipient ? ' active' : '');
+          const unread = getUnreadCount(user);
+          item.className = 'user-item' + (user === activeRecipient ? ' active' : '') + (unread > 0 ? ' has-unread' : '');
           item.onclick = () => selectRecipient(user);
 
           const avatar = document.createElement('div');
@@ -1737,6 +1887,16 @@ CHAT_HTML = r"""<!doctype html>
           meta.appendChild(status);
           item.appendChild(avatar);
           item.appendChild(meta);
+
+          if (unread > 0) {
+            const badge = document.createElement('span');
+            badge.className = 'unread-badge';
+            badge.id = `unreadBadge_${user}`;
+            badge.textContent = formatUnreadCount(unread);
+            badge.setAttribute('aria-label', `${unread} unread message${unread === 1 ? '' : 's'}`);
+            item.appendChild(badge);
+          }
+
           userList.appendChild(item);
         });
       }
@@ -1765,7 +1925,8 @@ CHAT_HTML = r"""<!doctype html>
       });
 
       // WebSocket Connection
-      window.connect = function() {
+      function connect() {
+        if (ws && ws.readyState < WebSocket.CLOSING) return;
         const rawName = (usernameInput.value || '').trim();
         if (!/^[A-Za-z0-9_-]{2,24}$/.test(rawName)) {
           joinErr.textContent = 'Use 2–24 letters, numbers, _ or - without spaces.';
@@ -1777,20 +1938,25 @@ CHAT_HTML = r"""<!doctype html>
         joinBtn.disabled = true;
         joinBtn.textContent = 'Connecting...';
 
+        if (myName && myName !== rawName) {
+          messagesByPeer.clear();
+          chatFeed.replaceChildren();
+          seenMessageIds.clear();
+          unreadCounts.clear();
+        }
         myName = rawName;
+        loadUnreadCounts();
+        updateRosterUI();
+        updateDocumentTitle();
         const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
         const url = `${protocol}//${location.host}/ws/chat/${encodeURIComponent(myName)}`;
 
-        ws = new WebSocket(url);
+        const socket = ws = new WebSocket(url);
+        let joined = false;
+        const joinTimeout = setTimeout(() => { if (!joined) socket.close(); }, 10000);
 
-        ws.onopen = () => {
-          onboardingModal.style.display = 'none';
-          userPill.style.display = 'flex';
-          currentUsername.textContent = myName;
-          appendSystemAlert(`Connected to secure messaging as @${myName}`, 'info');
-        };
-
-        ws.onmessage = (event) => {
+        socket.onmessage = (event) => {
+          if (ws !== socket) return;
           let data;
           try {
             data = JSON.parse(event.data);
@@ -1800,20 +1966,63 @@ CHAT_HTML = r"""<!doctype html>
 
           if (data.type === 'users') {
             onlineUsers = data.users || [];
+            if (!joined && onlineUsers.includes(myName)) {
+              joined = true;
+              clearTimeout(joinTimeout);
+              onboardingModal.style.display = 'none';
+              userPill.style.display = 'flex';
+              currentUsername.textContent = myName;
+              msgInput.disabled = !activeRecipient || !onlineUsers.includes(activeRecipient);
+              validateComposer();
+              appendSystemAlert(`Connected to secure messaging as @${myName}`, 'info');
+              loadUnreadCounts();
+            }
             updateRosterUI();
+            updateDocumentTitle();
             if (activeRecipient && !onlineUsers.includes(activeRecipient)) {
               recipientStatus.textContent = 'User went offline';
             }
           } else if (data.type === 'message') {
-            const peer = data.sender === myName ? data.recipient : data.sender;
+            const msgKey = data.message_id || `${data.sender}_${data.timestamp}_${data.text}`;
+            if (seenMessageIds.has(msgKey)) {
+              return;
+            }
+            seenMessageIds.add(msgKey);
+            if (seenMessageIds.size > 2000) {
+              const oldest = seenMessageIds.values().next().value;
+              seenMessageIds.delete(oldest);
+            }
+
+            const isSelf = data.sender === myName;
+            const peer = isSelf ? data.recipient : data.sender;
             if (!messagesByPeer.has(peer)) {
               messagesByPeer.set(peer, []);
             }
             messagesByPeer.get(peer).push(data);
 
             if (peer === activeRecipient) {
-              chatFeed.appendChild(createMessageElement(data, data.sender === myName));
+              chatFeed.appendChild(createMessageElement(data, isSelf));
               chatFeed.scrollTop = chatFeed.scrollHeight;
+            }
+
+            if (!isSelf) {
+              const isDocVisible = typeof document !== 'undefined' && document.visibilityState === 'visible';
+              const isActivelyViewing = (peer === activeRecipient) && isDocVisible;
+              if (isActivelyViewing) {
+                markAsRead(peer);
+              } else {
+                const count = (unreadCounts.get(peer) || 0) + 1;
+                unreadCounts.set(peer, count);
+                saveUnreadCounts();
+                updateRosterUI();
+                updateDocumentTitle();
+                const badge = $(`unreadBadge_${peer}`);
+                if (badge) {
+                  badge.classList.remove('pulse');
+                  void badge.offsetWidth;
+                  badge.classList.add('pulse');
+                }
+              }
             }
           } else if (data.type === 'warning') {
             appendSystemAlert(`Security Policy Notice: ${data.message}`, 'warn');
@@ -1822,28 +2031,32 @@ CHAT_HTML = r"""<!doctype html>
             blockedModal.style.display = 'flex';
             msgInput.disabled = true;
             sendBtn.disabled = true;
-            ws.close();
+            socket.close();
           }
         };
 
-        ws.onclose = () => {
+        socket.onclose = () => {
+          clearTimeout(joinTimeout);
+          if (ws !== socket) return;
+          ws = null;
+          onlineUsers = [];
+          updateRosterUI();
+          userPill.style.display = 'none';
+          msgInput.disabled = true;
+          sendBtn.disabled = true;
           if (blockedModal.style.display !== 'flex') {
-            appendSystemAlert('Disconnected from the secure messaging service.', 'warn');
-            msgInput.disabled = true;
-            sendBtn.disabled = true;
+            onboardingModal.style.display = 'flex';
+            joinBtn.disabled = false;
+            joinBtn.textContent = 'Join Secure Chat';
+            joinErr.textContent = joined ? 'Disconnected. Join again to reconnect.' : 'Unable to establish a secure chat connection.';
+            joinErr.style.display = 'block';
           }
         };
-
-        ws.onerror = () => {
-          joinBtn.disabled = false;
-          joinBtn.textContent = 'Join Secure Chat';
-          joinErr.textContent = 'Unable to establish secure WebSocket connection.';
-          joinErr.style.display = 'block';
-        };
-      };
+      }
+      window.connect = connect;
 
       // Send Message
-      window.send = function() {
+      function send() {
         const text = (msgInput.value || '').trim();
         if (!text || !activeRecipient) return;
 
@@ -1855,16 +2068,22 @@ CHAT_HTML = r"""<!doctype html>
           msgInput.value = '';
           validateComposer();
         }
-      };
+      }
+      window.send = send;
 
       sendBtn.onclick = send;
 
       // Cloudflare Tunnel & LAN QR Sharing
-      async function copyJoinUrl(textId, btnId) {
-        const textElem = $(textId);
+      let inviteLink = null;
+      let inviteQrUrl = null;
+      let inviteState = null;
+      let inviteValidUntil = 0;
+      let checkingInvite = false;
+
+      async function copyJoinUrl(btnId) {
         const btnElem = $(btnId);
-        const text = textElem ? textElem.textContent : '';
-        if (!text || text.startsWith('Loading')) return;
+        const text = inviteLink;
+        if (!text) return;
         try {
           if (navigator.clipboard && navigator.clipboard.writeText) {
             await navigator.clipboard.writeText(text);
@@ -1885,29 +2104,69 @@ CHAT_HTML = r"""<!doctype html>
       }
       window.copyJoinUrl = copyJoinUrl;
 
+      function renderInvitation(data) {
+        inviteLink = data?.active_joining_url || null;
+        inviteQrUrl = inviteLink && data.qr_url;
+        for (const prefix of ['onboarding', 'invite']) {
+          const badge = $(prefix + 'AccessBadge');
+          const link = $(prefix + 'UrlText');
+          const qr = $(prefix + 'QrImg');
+          const isPublic = data?.joining_mode === 'public_https';
+          const badgeClass = 'access-badge' + (inviteLink ? (isPublic ? ' public' : ' lan') : '');
+          const label = data?.sharing_state === 'reconnecting' ? 'Checking connection' : inviteLink ?
+            (isPublic ? 'Public access (HTTPS)' : 'Verified local Wi-Fi (HTTP)') : 'Disconnected · no verified link';
+          if (badge.className !== badgeClass) badge.className = badgeClass;
+          if (badge.textContent !== label) badge.textContent = label;
+          if (link.textContent !== (inviteLink || '')) link.textContent = inviteLink || '';
+          if (inviteLink && link.getAttribute('href') !== inviteLink) link.href = inviteLink;
+          else if (!inviteLink) link.removeAttribute('href');
+          $(prefix + 'CopyBtn').disabled = !inviteLink;
+          const hasCurrentImage = inviteQrUrl && qr.getAttribute('src') === inviteQrUrl;
+          qr.parentElement.hidden = !hasCurrentImage || !qr.complete || !qr.naturalWidth;
+          if (!inviteQrUrl) qr.removeAttribute('src');
+          else if (!hasCurrentImage) qr.src = inviteQrUrl;
+        }
+      }
+
+      function retainInvitationOnError() {
+        if (inviteState?.active_joining_url && Date.now() < inviteValidUntil) {
+          renderInvitation({...inviteState, sharing_state: 'reconnecting'});
+        } else {
+          renderInvitation(null);
+        }
+      }
+
+      for (const imageId of ['onboardingQrImg', 'inviteQrImg']) {
+        const qr = $(imageId);
+        qr.addEventListener('load', () => {
+          if (inviteQrUrl && qr.getAttribute('src') === inviteQrUrl) qr.parentElement.hidden = false;
+        });
+        qr.addEventListener('error', () => {
+          qr.parentElement.hidden = true;
+          qr.removeAttribute('src');
+        });
+      }
+
       async function refreshTunnelState() {
+        if (checkingInvite) return;
+        checkingInvite = true;
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 4500);
         try {
-          const res = await fetch('/api/tunnel/state', { cache: 'no-store' });
-          if (!res.ok) return;
-          const data = await res.json();
-          const isPublic = Boolean(data.is_public_ready && data.public_url);
-          const activeUrl = data.active_joining_url || (data.local_url ? (data.local_url + '/chat') : location.href);
-
-          const updateSection = (badgeId, textId) => {
-            const badge = $(badgeId);
-            const text = $(textId);
-            if (badge) {
-              badge.className = 'access-badge ' + (isPublic ? 'public' : 'lan');
-              badge.textContent = isPublic ? 'PUBLIC ACCESS (HTTPS)' : 'LOCAL WI-FI ONLY (HTTP)';
-            }
-            if (text) {
-              text.textContent = activeUrl;
-            }
-          };
-
-          updateSection('onboardingAccessBadge', 'onboardingUrlText');
-          updateSection('inviteAccessBadge', 'inviteUrlText');
-        } catch (_) {}
+          const res = await fetch('/api/tunnel/state', {cache: 'no-store', signal: controller.signal});
+          if (!res.ok) {
+            retainInvitationOnError();
+            return;
+          }
+          inviteState = await res.json();
+          inviteValidUntil = Date.now() + inviteState.share_valid_for * 1000;
+          renderInvitation(inviteState);
+        } catch {
+          retainInvitationOnError();
+        } finally {
+          clearTimeout(timeout);
+          checkingInvite = false;
+        }
       }
 
       const openInviteBtn = $('openInviteBtn');
@@ -1926,6 +2185,38 @@ CHAT_HTML = r"""<!doctype html>
       }
 
       refreshTunnelState();
+      const invitationTimer = setInterval(refreshTunnelState, 5000);
+      window.addEventListener('pagehide', () => clearInterval(invitationTimer), {once: true});
+      window.addEventListener('pageshow', event => { if (event.persisted) location.reload(); });
+
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible' && activeRecipient) {
+          markAsRead(activeRecipient);
+        }
+      });
+      window.addEventListener('focus', () => {
+        if (activeRecipient) {
+          markAsRead(activeRecipient);
+        }
+      });
+
+      window.SentinelChat = {
+        getUnreadCount,
+        getUnreadCounts: () => Object.fromEntries(unreadCounts),
+        getTotalUnread: getTotalUnreadCount,
+        markAsRead,
+        formatUnreadCount,
+        updateDocumentTitle,
+        loadUnreadCounts,
+        saveUnreadCounts,
+        updateRosterUI,
+        getState: () => ({
+          activeRecipient,
+          myName,
+          unreadCounts: Object.fromEntries(unreadCounts),
+          seenCount: seenMessageIds.size
+        })
+      };
 
     })();
   </script>
@@ -1935,8 +2226,9 @@ CHAT_HTML = r"""<!doctype html>
 
 
 @router.get("/chat", response_class=HTMLResponse)
-async def chat_page() -> str:
-    return CHAT_HTML
+async def chat_page(request: Request) -> HTMLResponse:
+    chat_invitation.observe_chat_page(request)
+    return HTMLResponse(CHAT_HTML, headers={CHAT_INSTANCE_HEADER: chat_invitation.instance, "Cache-Control": "no-store"})
 
 
 @router.get("/dashboard", response_class=HTMLResponse)
@@ -1970,16 +2262,40 @@ async def chat_state() -> dict:
 
 
 @router.get("/api/tunnel/state")
-def tunnel_state() -> dict:
+async def tunnel_state(request: Request) -> dict:
     from backend.network.tunnel import tunnel_manager
-    return tunnel_manager.status_dict()
+
+    context = boundary(request)
+    if not (context.local or context.tunnel or chat_invitation.lan_candidate(request)):
+        raise HTTPException(404)
+    if not demo_security.can_view(request):
+        selected = chat_invitation.snapshot(allow_lan=not context.tunnel)
+        return {**selected, "local_ip": None, "local_url": None, "status": "public_route"}
+    status = await asyncio.to_thread(tunnel_manager.status_dict)
+    selected = chat_invitation.snapshot(allow_lan=not context.tunnel)
+    if selected["is_public_ready"] and status["mode"] == "disabled":
+        status.update(status="running", error=None)
+    note = {"public_https": "The public Chat page reached this Sentinel instance.",
+            "local_lan": "A separate LAN client has reached the Chat page.",
+            "unavailable": "No recently verified sharing link."}[selected["joining_mode"]]
+    if selected["sharing_state"] == "reconnecting":
+        status["status"] = "reconnecting"
+        note = "Checking connection. The previously verified Chat link is retained temporarily."
+    return {**status, **selected, "public_hostname_verified": selected["is_public_ready"],
+            "readiness_note": note}
 
 
 @router.get("/api/tunnel/qr.svg")
-def tunnel_qr_svg() -> Response:
-    from backend.network.tunnel import tunnel_manager
+async def tunnel_qr_svg(request: Request, v: str | None = None) -> Response:
     from backend.network.qr_generator import generate_qr_svg
-    svg = generate_qr_svg(tunnel_manager.active_joining_url)
+
+    context = boundary(request)
+    if not (context.local or context.tunnel or chat_invitation.lan_candidate(request)):
+        raise HTTPException(404)
+    selected = chat_invitation.snapshot(allow_lan=not context.tunnel)
+    if not selected["qr_url"] or (v is not None and selected["qr_url"] != f"/api/tunnel/qr.svg?v={v}"):
+        raise HTTPException(404, "No matching verified chat link")
+    svg = generate_qr_svg(selected["active_joining_url"])
     return Response(
         content=svg,
         media_type="image/svg+xml",
