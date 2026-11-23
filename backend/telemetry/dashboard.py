@@ -69,12 +69,12 @@ async def applications_page(request: Request):
     if not legacy:
         from backend.console import FILES, wrap_existing
 
+        chart = (FILES / "http-flood-traffic.html").read_text(encoding="utf-8")
+        style = (FILES / "http-flood-chart.css").read_text(encoding="utf-8")
+        script = "\n".join((FILES / name).read_text(encoding="utf-8")
+                           for name in ("http-flood-chart.js", "http-flood-traffic.js"))
+        page = page.replace("<!-- HTTP flood traffic -->", f"<style>{style}</style>{chart}<script>{script}</script>")
         if is_local(request):
-            chart = (FILES / "http-flood-traffic.html").read_text(encoding="utf-8")
-            style = (FILES / "http-flood-chart.css").read_text(encoding="utf-8")
-            script = "\n".join((FILES / name).read_text(encoding="utf-8")
-                               for name in ("http-flood-chart.js", "http-flood-traffic.js"))
-            page = page.replace("<!-- local HTTP flood traffic -->", f"<style>{style}</style>{chart}<script>{script}</script>")
             scan = (FILES / "port-scan-monitor.html").read_text(encoding="utf-8")
             scan_script = (FILES / "port-scan.js").read_text(encoding="utf-8")
             page = page.replace("<!-- port scan monitor -->", f"{scan}<script>{scan_script}</script>")

@@ -16,6 +16,9 @@
     id('hf-window-total').textContent = state.totals.total;
     id('hf-window-accepted').textContent = state.totals.accepted;
     id('hf-window-blocked').textContent = state.totals.blocked;
+    id('hf-window-run').textContent = state.run_id ?? '—';
+    id('hf-host-count').textContent = state.sources?.['host-loopback'] ?? '—';
+    id('hf-browser-count').textContent = state.sources?.['cloudflare-browser'] ?? '—';
     const {block_rps, window_seconds} = state.thresholds;
     const rule = `The dashed ${block_rps} req/s threshold applies to the detector’s rolling ${window_seconds}-second window. ` +
       'The traffic lines count observed HTTP 200 and 429 responses by arrival second.';
@@ -52,7 +55,7 @@
     if (socketFresh()) return;
     render(await read('/api/attack-lab/verification/traffic', signal), 'Live · HTTP fallback');
   }, () => {
-    if (!socketFresh()) setStatus(latest ? 'Connection interrupted · showing last update' : 'Local lab telemetry unavailable');
+    if (!socketFresh()) setStatus(latest ? 'Connection interrupted · showing last update' : 'Lab telemetry unavailable');
   }, 1000);
   window.addEventListener('pagehide', () => {
     disposed = true;

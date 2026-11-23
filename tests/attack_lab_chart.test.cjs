@@ -5,6 +5,7 @@ const vm = require('node:vm');
 
 const renderer = readFileSync('backend/console/http-flood-chart.js', 'utf8');
 const monitor = readFileSync('backend/console/http-flood-traffic.js', 'utf8');
+const lab = readFileSync('backend/console/attack-lab.js', 'utf8');
 
 function snapshot(now, entries = {}) {
   const first = Math.floor(now - 60);
@@ -118,4 +119,63 @@ test('monitor renders an initial HTTP window, resumes with WebSocket, and keeps 
   assert.equal(id('hf-window-total').textContent, 6);
   assert.equal(id('hf-traffic-status').textContent, 'Live');
   windowEvents.pagehide();
+});
+
+test('authenticated Cloudflare lab submits sequenced same-origin browser samples', async () => {
+  const runId = '0123456789abcdef';
+  const requests = [];
+  const elements = new Map();
+  const callbacks = {};
+  let metrics, resolveSamples;
+  const samples = new Promise(resolve => { resolveSamples = resolve; });
+  const run = {run_id: runId, snapshot_at: 2, started_at: 2, running: true, owns_run: true,
+    request_count: 5, config: {rate: 1, concurrency: 1}, timeline: [], run_source: 'cloudflare-browser',
+    flood: {generated: 0, in_flight: 0, successful: 0, blocked: 0}};
+  function id(name) {
+    if (!elements.has(name)) {
+      const element = Object.assign(svgNode('div'), {dataset: {}, handlers: {}, validity: {valid: true},
+        valueAsNumber: 5, addEventListener(event, listener) { this.handlers[event] = listener; },
+        reportValidity() { return true; }});
+      if (name === 'lab-lifecycle') {
+        element.children = Array.from({length: 5}, () => ({dataset: {}, querySelector() { return {}; }}));
+      }
+      elements.set(name, element);
+    }
+    return elements.get(name);
+  }
+  const auth = {local: false, remoteConsole: true, authenticated: false, async fetch(path, options) {
+    const url = new URL(path, 'https://demo.example');
+    const json = (body, status = 200) => ({ok: status < 300, status, json: async () => body});
+    if (path === '/api/attack-lab/verification') return json({snapshot_at: 1, timeline: []});
+    requests.push({url, method: options.method});
+    if (url.pathname.endsWith('/start')) return json(run);
+    const sequence = Number(url.searchParams.get('sequence'));
+    if (sequence === 5) resolveSamples();
+    return json({run_id: runId, sequence}, sequence >= 3 ? 429 : 200);
+  }};
+  const window = {SentinelAuth: auth, SentinelConsole: {id, node: svgNode, status() {},
+    metrics(_, values) { metrics = values; }, facts() {}},
+    addEventListener(name, callback) { callbacks[name] = callback; }};
+  class WebSocket {
+    constructor(url) { assert.equal(url.href, 'wss://demo.example/ws/dashboard?view=http-policy-run'); }
+    addEventListener() {}
+  }
+  vm.runInNewContext(lab, {window, document: {body: {dataset: {labMode: 'browser'}}},
+    location: new URL('https://demo.example/attack-lab'), URL, URLSearchParams, AbortSignal, AbortController, WebSocket,
+    setTimeout(callback, interval) { if (interval === 1150) queueMicrotask(callback); }, clearTimeout() {}});
+  await new Promise(setImmediate);
+  assert.equal(id('lab-start').disabled, true);
+  auth.authenticated = true;
+  callbacks['sentinel-auth-changed']();
+  assert.equal(id('lab-start').disabled, false);
+  id('lab-start').handlers.click();
+  await samples;
+  assert.equal(requests[0].url.pathname, '/api/attack-lab/http-verification/start');
+  assert.equal(requests[0].url.searchParams.get('request_count'), '5');
+  const samplesSent = requests.slice(1);
+  assert.ok(samplesSent.every(({url, method}) => url.origin === 'https://demo.example' &&
+    url.pathname === '/api/attack-lab/http-verification/request' && method === 'POST' &&
+    url.searchParams.get('run_id') === runId));
+  assert.deepEqual(samplesSent.map(({url}) => Number(url.searchParams.get('sequence'))), [1, 2, 3, 4, 5]);
+  assert.ok(metrics.some(([label]) => label === 'Mean server processing latency'));
 });

@@ -1,6 +1,7 @@
 """Exercise the local policy check over actual HTTP and dashboard WebSocket sockets."""
 import asyncio
 import json
+import socket
 import threading
 import time
 
@@ -13,10 +14,13 @@ from websockets.sync.client import connect
 from app import app
 from backend import attack_lab
 from backend.network.port_scan import PortScanMonitor, ScanPolicy, VERIFY_PATH
+from backend.network.tunnel import tunnel_manager
 from backend.security import http_flood
+from backend.security.demo_access import COOKIE
 
 VERIFICATION = "/api/attack-lab/verification"
 TRAFFIC = VERIFICATION + "/traffic"
+BROWSER_VERIFICATION = "/api/attack-lab/http-verification"
 ADMIN_TOKEN = "local-policy-check-test-token"
 STAGES = [
     "HTTP_TRAFFIC_OBSERVED", "HTTP_FLOOD_ATTACK_DETECTED", "HTTP_SECURITY_ALERT",
@@ -137,6 +141,129 @@ def test_exact_window_boundary_and_status_filter():
     now = 160.9
     assert_traffic_counts(verifier.traffic_snapshot(), [])
     assert verifier.traffic_responses == []
+
+
+@pytest.fixture
+def cloudflare_hop(server, monkeypatch):
+    monkeypatch.setenv("DASHBOARD_REMOTE_ENABLED", "true")
+    monkeypatch.setenv("HTTP_FLOOD_REMOTE_ENABLED", "false")
+    monkeypatch.setenv("HTTP_POLICY_REMOTE_VERIFY_ENABLED", "true")
+    monkeypatch.setenv("CLOUDFLARE_PUBLIC_HOSTNAME", "demo.example")
+    monkeypatch.setattr(tunnel_manager, "mode", "named")
+    _, origin, _ = server
+    edge = {"Host": "demo.example", "Origin": "https://demo.example", "X-Forwarded-Proto": "https",
+            "CF-Connecting-IP": "203.0.113.91"}
+    with httpx.Client(base_url=origin, headers=edge, timeout=4, trust_env=False) as remote:
+        yield remote
+
+
+def browser_sign_in(remote):
+    login = remote.post("/api/auth/login", json={"token": ADMIN_TOKEN}).raise_for_status()
+    return {"Cookie": f"{COOKIE}={login.cookies[COOKIE]}", "X-CSRF-Token": login.headers["X-CSRF-Token"]}
+
+
+@pytest.mark.parametrize("request_count", [5, 25])
+def test_cloudflare_browser_verification_shares_real_results_with_local_dashboard(server, cloudflare_hop, request_count):
+    local, origin, loopback_responses = server
+    remote = cloudflare_hop
+    assert remote.get("/attack-lab").status_code == 303
+    assert remote.get(TRAFFIC).status_code == 401
+    assert remote.post(BROWSER_VERIFICATION + "/start").status_code == 401
+    auth = browser_sign_in(remote)
+    assert 'data-lab-mode="browser"' in remote.get("/attack-lab", headers=auth).raise_for_status().text
+    applications = remote.get("/dashboard/applications", headers=auth).raise_for_status().text
+    assert 'id="hf-chart"' in applications and 'id="port-scan-monitor"' not in applications
+    assert remote.get("/dashboard/network", headers=auth).status_code == 200
+    assert remote.get("/dashboard/chat", headers=auth).status_code == 200
+    assert remote.get("/chat").status_code == 200
+    assert remote.get(TRAFFIC, headers={**auth, "Origin": "https://elsewhere.example"}).status_code == 401
+    for path in (VERIFICATION + "/start", "/api/attack-lab/http-flood/start",
+                 "/api/attack-lab/burst", "/api/network/quarantine/unblock/203.0.113.91"):
+        assert remote.post(path, headers=auth).status_code == 404
+    assert local.post(BROWSER_VERIFICATION + "/start", headers=sign_in(local, origin)).status_code == 404
+    assert remote.post(BROWSER_VERIFICATION + "/start", headers={"Cookie": auth["Cookie"]}).status_code == 403
+    for params in ({"request_count": 0}, {"request_count": 26}, {"host": "example.invalid"}):
+        assert remote.post(BROWSER_VERIFICATION + "/start", headers=auth, params=params).status_code == 422
+    assert remote.post(BROWSER_VERIFICATION + "/start", headers=auth, json={}).status_code == 422
+
+    started = remote.post(BROWSER_VERIFICATION + "/start", headers=auth,
+                          params={"request_count": request_count}).raise_for_status().json()
+    run_id = started["run_id"]
+    assert started["owns_run"] and started["run_source"] == "cloudflare-browser"
+    assert remote.post(BROWSER_VERIFICATION + "/start", headers=auth).status_code == 409
+    assert local.post(VERIFICATION + "/start", headers=sign_in(local, origin)).status_code == 409
+    assert remote.post(BROWSER_VERIFICATION + "/reset", headers=auth, params={"run_id": run_id}).status_code == 409
+    other = browser_sign_in(remote)
+    assert not remote.get(VERIFICATION, headers=other).raise_for_status().json()["owns_run"]
+    assert remote.post(BROWSER_VERIFICATION + "/stop", headers=other, params={"run_id": run_id}).status_code == 409
+
+    statuses = []
+    for sequence in range(1, request_count + 1):
+        params = {"run_id": run_id, "sequence": sequence}
+        response = remote.post(http_flood.BROWSER_TARGET, headers=auth, params=params)
+        assert response.json() == params
+        statuses.append(response.status_code)
+        if sequence == 1:
+            assert remote.post(http_flood.BROWSER_TARGET, headers=auth, params=params).status_code == 409
+            assert remote.post(http_flood.BROWSER_TARGET, headers=auth,
+                               params={**params, "sequence": 2}).status_code == 409
+        if sequence < request_count:
+            time.sleep(1.05)
+    assert len(statuses) == request_count and statuses[:5] == [200, 200, 429, 429, 429]
+    assert not loopback_responses
+    finished = remote.get(VERIFICATION, headers=auth).raise_for_status().json()
+    assert finished["outcome"] == "complete" and finished["latency_average_ms"] >= 0
+    events = [event["type"] for event in finished["timeline"] if event["type"] in STAGES]
+    assert list(dict.fromkeys(events)) == STAGES
+    assert all("message" not in event for event in finished["timeline"])
+    assert not {"target_origin", "gatv2", "source_ip"} & finished.keys()
+    local_state = local.get(VERIFICATION).raise_for_status().json()
+    assert local_state["run_id"] == run_id == finished["run_id"]
+    assert local_state["detection_rps"] >= local_state["thresholds"]["block_rps"]
+    traffic = local.get(TRAFFIC).raise_for_status().json()
+    assert_traffic_counts(traffic, statuses)
+    assert traffic["sources"] == {"host-loopback": 0, "cloudflare-browser": request_count}
+    assert traffic["run_id"] == run_id
+    port = int(origin.rsplit(":", 1)[1])
+    websocket_url = "ws://demo.example/ws/dashboard?view=http-policy-run"
+    with pytest.raises(InvalidStatus) as rejected:
+        with connect(websocket_url, sock=socket.create_connection(("127.0.0.1", port)),
+                     origin="https://demo.example", proxy=None,
+                     additional_headers={"X-Forwarded-Proto": "https", "CF-Connecting-IP": "203.0.113.91"}):
+            pass
+    assert rejected.value.response.status_code == 403
+    with connect(websocket_url, sock=socket.create_connection(("127.0.0.1", port)),
+                 origin="https://demo.example", proxy=None,
+                 additional_headers={"X-Forwarded-Proto": "https", "CF-Connecting-IP": "203.0.113.91",
+                                     "Cookie": auth["Cookie"]}) as stream:
+        update = json.loads(stream.recv(timeout=4))
+        assert update["type"] == "HTTP_POLICY_RUN" and update["run_id"] == run_id
+        assert update["flood"] == finished["flood"]
+    remote.post(BROWSER_VERIFICATION + "/reset", headers=auth, params={"run_id": run_id}).raise_for_status()
+    assert remote.post(BROWSER_VERIFICATION + "/start", headers=auth).status_code == 409
+    assert_traffic_counts(local.get(TRAFFIC).raise_for_status().json(), statuses)
+
+
+def test_cloudflare_browser_deadline_and_stop(server, cloudflare_hop, monkeypatch):
+    remote = cloudflare_hop
+    auth = browser_sign_in(remote)
+    monkeypatch.setenv("HTTP_FLOOD_REMOTE_ENABLED", "true")
+    assert remote.post("/api/attack-lab/http-flood/start", headers=auth).status_code == 404
+    started = remote.post(BROWSER_VERIFICATION + "/start", headers=auth,
+                          params={"request_count": 25}).raise_for_status().json()
+    params = {"run_id": started["run_id"]}
+    stopped = remote.post(BROWSER_VERIFICATION + "/stop", headers=auth, params=params).raise_for_status().json()
+    assert stopped["outcome"] == "stopped" and not stopped["running"]
+    assert remote.post(http_flood.BROWSER_TARGET, headers=auth, params={**params, "sequence": 1}).status_code == 409
+    remote.post(BROWSER_VERIFICATION + "/reset", headers=auth, params=params).raise_for_status()
+    verifier = attack_lab.policy_verification
+    verifier.phone_cooldown_until = 0
+    started = remote.post(BROWSER_VERIFICATION + "/start", headers=auth).raise_for_status().json()
+    verifier.phone_deadline = 0
+    assert remote.post(http_flood.BROWSER_TARGET, headers=auth,
+                       params={"run_id": started["run_id"], "sequence": 1}).status_code == 409
+    finished = remote.get(VERIFICATION, headers=auth).raise_for_status().json()
+    assert finished["outcome"] == "error" and finished["flood"]["generated"] == 0
 
 
 def test_real_verification_repeatable_with_dashboard_events(server):

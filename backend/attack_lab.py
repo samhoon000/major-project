@@ -7,14 +7,16 @@ import threading
 import time
 from collections import deque
 
-from fastapi import APIRouter, HTTPException, Request, Header, Depends
+from fastapi import APIRouter, HTTPException, Request, Header, Depends, Query
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from starlette.background import BackgroundTask
 
 from backend.network.runtime import network_runtime
 from backend.network.northfield_probe import enabled as probe_enabled, northfield_probe
 from backend.network.port_scan import VERIFY_PATH
-from backend.security.http_flood import PolicyCheckConfig, RunConfig, http_flood_simulator, policy_verification
+from backend.security.http_flood import (
+    BROWSER_TARGET, POLICY_CHECK_MAX_REQUESTS, PolicyCheckConfig, RunConfig, http_flood_simulator, policy_verification,
+)
 
 router = APIRouter()
 
@@ -313,7 +315,7 @@ ATTACK_LAB_HTML = r"""<!doctype html>
 @router.get("/attack-lab", response_class=HTMLResponse)
 def attack_lab_page(request: Request) -> str:
     from backend.http_flood_ui import http_flood_panel
-    from backend.security.demo_access import boundary, demo_security, is_remote_operator_console
+    from backend.security.demo_access import boundary, browser_verification_enabled, demo_security, is_remote_operator_console
     from backend.security_ui import security_panel
 
     local = boundary(request).local
@@ -326,48 +328,37 @@ def attack_lab_page(request: Request) -> str:
         document = (FILES / "northfield-probe.html").read_text(encoding="utf-8")
         script = (FILES / "northfield-probe.js").read_text(encoding="utf-8")
         return wrap_existing(request, "lab", document.replace("/* probe script */", script))
-    if local:
-        from backend.console import FILES
+    if local or remote_console:
+        from backend.console import FILES, wrap_existing
 
         document = (FILES / "attack-lab.html").read_text(encoding="utf-8")
         style = (FILES / "layout.css").read_text(encoding="utf-8")
-        script = "\n".join((FILES / name).read_text(encoding="utf-8")
-                           for name in ("layout.js", "attack-lab.js", "port-scan.js"))
-        return (document.replace("/* lab styles */", style)
-                .replace("<!-- administrator access -->", security_panel())
-                .replace("/* lab script */", script))
-    if remote_console and request.query_params.get("view") != "legacy":
-        from backend.console import wrap_existing
-        document = """<!doctype html>
-<html lang="en">
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Attack Lab · Sentinel AI</title>
-<style>
-  body { margin:0; background:#080e0b; color:#edf4ff; font:16px system-ui,sans-serif; }
-  main { max-width:720px; margin:auto; padding:clamp(16px,5vw,48px); }
-  section { background:#101b2b; border:1px solid #324763; border-radius:16px; padding:24px; }
-  h1 { font-size:clamp(2rem,5vw,3rem); margin:12px 0; }
-  h2 { font-size:1.3rem; }
-  p { color:#b7c8de; line-height:1.55; }
-  a { color:#a9d9ff; }
-  nav { display:flex; flex-wrap:wrap; gap:12px 24px; margin-top:24px; }
-</style>
-<main>
-  <h1>Attack Lab</h1>
-  <section aria-labelledby="northfield-target">
-    <h2 id="northfield-target">Northfield Student Portal</h2>
-    <p>Watch signed portal traffic, detection evidence, and policy status in Monitored Applications.</p>
-    <nav aria-label="Lab destinations">
-      <!-- northfield probe -->
-      <a class="console-link" href="/dashboard/applications?app=northfield-staging">View Live Monitoring</a>
-    </nav>
-    <!-- lab access -->
-  </section>
-</main>
-</html>"""
-        return wrap_existing(request, "lab", document.replace(
-            "<!-- lab access -->", "<p>Administrators can configure and run the HTTP policy check from localhost on the host computer.</p>"))
+        if local:
+            script = "\n".join((FILES / name).read_text(encoding="utf-8")
+                               for name in ("layout.js", "attack-lab.js", "port-scan.js"))
+            return (document.replace("/* lab styles */", style)
+                    .replace("<!-- administrator access -->", security_panel())
+                    .replace("/* lab script */", script))
+        sections = ("local port scan",) if browser_verification_enabled() else ("local controls", "local port scan")
+        for section in sections:
+            before, rest = document.split(f"<!-- begin {section} -->", 1)
+            _, after = rest.split(f"<!-- end {section} -->", 1)
+            document = before + after
+        if browser_verification_enabled():
+            document = (document.replace('data-lab-mode="local"', 'data-lab-mode="browser"')
+                        .replace("Local policy check", "Cloudflare browser verification")
+                        .replace("Start Attack Demonstration", "Start Verification")
+                        .replace("Sign in as a local administrator to configure or control a run.",
+                                 "Sign in to run a browser verification.")
+                        .replace("The check sends 1–25 requests to the isolated loopback endpoint, one at a time and at most one per second. Choose at least four requests to observe mitigation followed by a separate HTTP 429.",
+                                 "Your browser sends 1–25 requests through Cloudflare to the dedicated verification endpoint, one at a time. Keep this page open during the run."))
+        else:
+            document = document.replace('data-lab-mode="local"', 'data-lab-mode="observe"')
+        document = (document.replace("Sentinel / localhost", "Sentinel / Cloudflare")
+                    .replace("<!-- remote lab note -->",
+                             '<p><a href="/dashboard/applications?app=northfield-staging">Northfield monitoring</a></p>')
+                    .replace("/* lab script */", (FILES / "attack-lab.js").read_text(encoding="utf-8")))
+        return wrap_existing(request, "lab", document)
     return ATTACK_LAB_HTML.replace("</header>", "</header>" + security_panel(), 1).replace("<!-- HTTP_FLOOD_PANEL -->", http_flood_panel(controls=True))
 
 
@@ -413,21 +404,30 @@ async def http_flood_target(request: Request) -> dict:
     return {"status": "ok", "run_id": request.state.http_lab_run_id}
 
 
+def verification_view_is_local(request: Request) -> bool:
+    from backend.security.demo_access import boundary, demo_security, is_remote_operator_console
+
+    if boundary(request).local:
+        return True
+    if not is_remote_operator_console(request):
+        raise HTTPException(404)
+    if not demo_security.can_view(request):
+        raise HTTPException(401, "Operator sign-in required")
+    return False
+
+
 @router.get("/api/attack-lab/verification")
 async def verification_state(request: Request):
-    from backend.security.demo_access import boundary
+    if verification_view_is_local(request):
+        return policy_verification.get_state()
+    from backend.security.demo_access import demo_security
 
-    if not boundary(request).local:
-        raise HTTPException(404)
-    return policy_verification.get_state()
+    return policy_verification.operator_snapshot(demo_security.session(request))
 
 
 @router.get("/api/attack-lab/verification/traffic")
 async def verification_traffic(request: Request):
-    from backend.security.demo_access import boundary
-
-    if not boundary(request).local:
-        raise HTTPException(404)
+    verification_view_is_local(request)
     return JSONResponse(policy_verification.traffic_snapshot(), headers={"Cache-Control": "no-store"})
 
 
@@ -495,6 +495,54 @@ async def verification_command(request: Request, action: str):
     if action == "reset":
         return await policy_verification.reset(stop_running=True)
     raise HTTPException(404)
+
+
+def browser_verification_session(request: Request, fields):
+    from backend.security.demo_access import browser_verification_enabled, demo_security, is_remote_operator_console
+
+    if not browser_verification_enabled() or not is_remote_operator_console(request):
+        raise HTTPException(404)
+    session = demo_security.session(request)
+    if not session or request.headers.get("x-admin-token"):
+        raise HTTPException(401, "Cloudflare operator sign-in required")
+    demo_security.require_control(request, dashboard=True)
+    params = request.query_params
+    if (len(params.multi_items()) != len(params) or set(params) - fields
+            or request.headers.get("content-length") not in (None, "0")
+            or request.headers.get("transfer-encoding")):
+        raise HTTPException(422, "Unexpected verification parameters or request body")
+    return session
+
+
+@router.post("/api/attack-lab/http-verification/start")
+async def browser_verification_start(request: Request, request_count: int = Query(default=1, ge=1, le=POLICY_CHECK_MAX_REQUESTS)):
+    session = browser_verification_session(request, {"request_count"})
+    try:
+        return await policy_verification.start_phone_check(session, request_count)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@router.post(BROWSER_TARGET)
+async def browser_verification_request(request: Request, run_id: str = Query(pattern="^[a-f0-9]{16}$"),
+                                       sequence: int = Query(ge=1, le=POLICY_CHECK_MAX_REQUESTS)):
+    session = browser_verification_session(request, {"run_id", "sequence"})
+    try:
+        status = await policy_verification.phone_request(session, run_id, sequence)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return JSONResponse({"run_id": run_id, "sequence": sequence}, status_code=status)
+
+
+@router.post("/api/attack-lab/http-verification/{action}")
+async def browser_verification_command(request: Request, action: str, run_id: str = Query(pattern="^[a-f0-9]{16}$")):
+    if action not in {"stop", "reset"}:
+        raise HTTPException(404)
+    session = browser_verification_session(request, {"run_id"})
+    try:
+        return await policy_verification.phone_command(session, run_id, action)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 async def require_lab_admin(request: Request, x_admin_token: str | None = Header(default=None)):

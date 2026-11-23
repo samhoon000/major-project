@@ -297,8 +297,11 @@ class TunnelManager:
                     if len(self._recent_logs) > 50:
                         self._recent_logs.pop(0)
                     if self.mode == "quick" and not self.public_hostname:
-                        public = re.search(r"https://([a-z0-9-]+\.trycloudflare\.com)\b", line_s, re.IGNORECASE)
-                        if public:
+                        # The assigned URL is on its own banner line. Error logs can
+                        # contain the provider's provisioning API URL before assignment.
+                        public = re.search(r"(?:^|\|)\s*https://([a-z0-9-]+\.trycloudflare\.com)\s*(?:\||$)",
+                                           line_s, re.IGNORECASE)
+                        if public and public.group(1).lower() != "api.trycloudflare.com":
                             self.public_hostname = public.group(1).lower()
                             log.info("[TUNNEL] Quick Tunnel URL: https://%s", self.public_hostname)
 
@@ -380,11 +383,13 @@ class TunnelManager:
         local_ip = self.local_ip
         local_url = f"http://{local_ip}:{self.local_port}"
         with self._lock:
-            # Check process liveness if marked as running
-            if self.process and self.process.poll() is not None and self.status == "running":
-                self.status = "error"
+            # The output pipe can close just before the child exits.
+            if self.process and self.status in {"starting", "running", "reconnecting"}:
                 code = self.process.poll()
-                self.error = f"cloudflared process terminated (exit code: {code})"
+                if code is not None:
+                    self.status = "error"
+                    last_log = self._recent_logs[-1] if self._recent_logs else f"exit code {code}"
+                    self.error = f"cloudflared process terminated ({last_log})"
 
             return {
                 "enabled": bool(self.token) or self.mode == "quick",

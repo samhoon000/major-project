@@ -51,12 +51,16 @@ def page(request, name):
     body = (FILES / f"{name}.html").read_text(encoding="utf-8")
     script = (FILES / f"{name}.js").read_text(encoding="utf-8")
     auth = security_panel() if name == "settings" else ""
-    if name == "overview" and boundary(request).local:
-        body = body.replace("<!-- local lab -->",
-                            '<a class="console-button console-primary" id="launch-demo-lab" href="/attack-lab">Launch Demo Lab</a>')
-        if network_probe_enabled():
-            body = body.replace("<!-- northfield evidence -->",
-                                '<a class="console-link" href="/attack-lab?view=northfield">Northfield Network Evidence</a>')
+    if name == "overview":
+        if boundary(request).local:
+            body = body.replace("<!-- lab link -->",
+                                '<a class="console-button console-primary" id="launch-demo-lab" href="/attack-lab">Launch Demo Lab</a>')
+            if network_probe_enabled():
+                body = body.replace("<!-- northfield evidence -->",
+                                    '<a class="console-link" href="/attack-lab?view=northfield">Northfield Network Evidence</a>')
+        elif is_remote_operator_console(request) and demo_security.can_view(request):
+            body = body.replace("<!-- lab link -->",
+                                '<a class="console-button console-primary" id="observe-demo-lab" href="/attack-lab">Watch Attack Lab</a>')
     title = next((label for key, _, label in NAVIGATION if key == name), "Chat Security")
     document = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">

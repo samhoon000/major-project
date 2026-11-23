@@ -1989,12 +1989,19 @@ def tunnel_qr_svg() -> Response:
 
 @router.websocket("/ws/dashboard")
 async def dashboard_socket(ws: WebSocket) -> None:
-    monitor = ws.query_params.get("view") == "chat-security"
-    lab_traffic = ws.query_params.get("view") == "http-flood-traffic"
-    if not demo_security.can_view(ws) or (is_remote_operator_console(ws) and not monitor):
+    from backend.security.http_flood import policy_verification
+
+    view = ws.query_params.get("view")
+    operator = is_remote_operator_console(ws)
+    lab_views = {
+        "http-flood-traffic": policy_verification.traffic_snapshot,
+        "http-policy-run": lambda: policy_verification.operator_snapshot(demo_security.session(ws)),
+    }
+    scoped_views = {"chat-security": chat_monitor_snapshot, **lab_views}
+    if not demo_security.can_view(ws) or (operator and view not in scoped_views):
         await ws.close(code=1008)
         return
-    if lab_traffic and not boundary(ws).local:
+    if view in lab_views and not (operator or boundary(ws).local):
         await ws.close(code=1008)
         return
     origin = ws.headers.get("origin")
@@ -2004,11 +2011,8 @@ async def dashboard_socket(ws: WebSocket) -> None:
         await ws.close(code=1008)
         return
     await ws.accept()
-    if monitor:
-        await chat_monitor_socket(ws)
-        return
-    if lab_traffic:
-        await http_lab_traffic_socket(ws)
+    if view in scoped_views:
+        await stream_dashboard_snapshot(ws, scoped_views[view])
         return
     dashboard_clients.add(ws)
     try:
@@ -2025,28 +2029,11 @@ async def dashboard_socket(ws: WebSocket) -> None:
         dashboard_clients.discard(ws)
 
 
-async def http_lab_traffic_socket(ws: WebSocket) -> None:
-    from backend.security.http_flood import policy_verification
-
-    try:
-        while True:
-            await ws.send_json(policy_verification.traffic_snapshot())
-            try:
-                message = await asyncio.wait_for(ws.receive(), timeout=1)
-            except asyncio.TimeoutError:
-                continue
-            if message["type"] != "websocket.disconnect":
-                await ws.close(code=1008)
-            return
-    except WebSocketDisconnect:
-        pass
-
-
-async def chat_monitor_socket(ws: WebSocket) -> None:
-    """Use the dashboard's authenticated socket without streaming private messages."""
+async def stream_dashboard_snapshot(ws: WebSocket, snapshot) -> None:
+    """Stream one permitted read-only view and recheck access before each update."""
     try:
         while demo_security.can_view(ws):
-            await ws.send_json(chat_monitor_snapshot())
+            await ws.send_json(snapshot())
             try:
                 message = await asyncio.wait_for(ws.receive(), timeout=1.0)
             except asyncio.TimeoutError:

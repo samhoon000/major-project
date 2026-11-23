@@ -133,6 +133,7 @@
 (() => {
   const {id, status, metrics, facts, chart, poll, read} = window.SentinelConsole;
   const local = Boolean(id('launch-demo-lab'));
+  const observeLab = local || Boolean(id('observe-demo-lab'));
   const history = new Map();
   const pipeline = id('overview-pipeline').children;
   let network, lab, stream, streamOpen = false, retry, disposed = false, priorAnomalies;
@@ -144,9 +145,11 @@
     const suspicious = network?.gatv2_network_anomalies;
     const completed = network?.completed_flows?.length;
     const alerts = lab?.timeline || [];
+    const detection = alerts.find(event => event.type === 'HTTP_FLOOD_ATTACK_DETECTED');
     const alert = alerts.find(event => event.type === 'HTTP_SECURITY_ALERT');
     const rule = alerts.find(event => event.type === 'HTTP_MITIGATION_ACTIVATED');
     const verified = alerts.find(event => event.type === 'HTTP_PROTECTION_VERIFIED');
+    const recovery = alerts.find(event => event.type === 'HTTP_FLOOD_RECOVERED');
     const captureStatus = running ? 'Running' : capture === 'starting' ? 'Starting' : 'Unavailable';
     const modelStatus = network?.gatv2 === 'available' ? 'Loaded' : 'Unavailable';
     const mitigationStatus = lab?.blocked ? 'HTTP restriction active' : verified ? 'HTTP rejection verified' :
@@ -170,13 +173,13 @@
       ['AI predictions', modelStatus === 'Loaded' ? predictions : null],
       ['Suspicious flows', modelStatus === 'Loaded' ? suspicious : null],
       ['Active local restrictions', network ? network.quarantine_count + Number(Boolean(lab?.blocked)) : null],
-      ['Local HTTP 429 responses', lab?.flood?.blocked]
+      ['Lab HTTP 429 responses', lab?.flood?.blocked]
     ]);
     facts('overview-health', [
       ['Packet capture', captureStatus],
       ['Capture interface', network?.selected_adapter_name || network?.interface],
       ['GATv2 model', modelStatus],
-      ['Dashboard event stream', local ? streamOpen ? 'Connected' : 'Connecting or unavailable' : 'See application stream'],
+      ['Lab event stream', observeLab ? streamOpen ? 'Connected' : 'Connecting or unavailable' : null],
       ['Response policy', mitigationStatus],
       ['Quarantined nodes', network?.quarantined_ips?.join(', ') || '—']
     ]);
@@ -186,17 +189,26 @@
     id('overview-network-current').textContent = running ?
       `${network.packets_per_second} packets/s · ${network.bytes_per_second} bytes/s · ${completed} retained completed flows` :
       'Waiting for active packet capture.';
-    if (local) {
+    if (observeLab) {
       id('overview-http').hidden = false;
       status('overview-http-status', lab?.blocked ? 'Restriction active' : verified ? 'HTTP 429 verified' :
-        lab?.running ? 'Observing requests' : lab ? 'Awaiting evidence' : 'Local evidence unavailable',
+        lab?.running ? 'Observing requests' : lab ? 'Awaiting evidence' : 'Lab evidence unavailable',
       lab?.blocked ? 'warn' : verified ? 'good' : '');
       const time = value => new Date(value * 1000).toLocaleTimeString();
+      const browserRun = lab?.run_source === 'cloudflare-browser';
+      const counts = lab?.flood;
       facts('overview-http-evidence', [
+        ['Run ID', lab?.started_at ? lab.run_id : null],
+        ['Requests observed', lab?.started_at && counts ? `${counts.generated} of ${lab.request_count}` : null],
+        ['HTTP responses', lab?.started_at && counts ? `${counts.successful} accepted · ${counts.blocked} blocked` : null],
+        [browserRun ? 'Mean server processing latency' : 'Mean response latency',
+          lab?.latency_average_ms == null ? null : `${lab.latency_average_ms} ms`],
+        ['Detection', detection ? `${detection.observed_rps} requests/s at ${time(detection.timestamp)}` : 'Pending'],
         ['Security alert', alert ? `${alert.severity} · ${alert.alert_id} · ${time(alert.timestamp)}` : 'No current-run alert'],
-        ['Source and identity', alert ? `${alert.detection_method} · ${alert.source_identity}` : null],
-        ['Automatic mitigation', rule ? `${lab.blocked ? 'Active' : 'Expired'} · ${rule.target} · ${time(rule.expires_at)}` : 'Pending'],
-        ['Verified enforcement', verified ? `HTTP ${verified.status_code} observed at ${time(verified.timestamp)}` : 'Pending']
+        ['Source and identity', lab?.started_at ? `${lab.detection_method} · ${browserRun ? 'Cloudflare browser' : 'Sentinel host loopback'}` : null],
+        ['Automatic mitigation', rule ? `${lab.blocked ? 'Active' : 'Expired'} · activated ${time(rule.timestamp)}` : 'Pending'],
+        ['Verified enforcement', verified ? `HTTP ${verified.status_code} observed at ${time(verified.timestamp)}` : 'Pending'],
+        ['Recovery', recovery ? `No active restriction at ${time(recovery.timestamp)}` : null]
       ]);
     }
   }
@@ -206,14 +218,15 @@
   }
 
   function connectEvents() {
-    if (!local || disposed) return;
-    const url = new URL('/ws/dashboard', location.href);
+    if (!observeLab || disposed) return;
+    const url = new URL(local ? '/ws/dashboard' : '/ws/dashboard?view=http-policy-run', location.href);
     url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     stream = new WebSocket(url);
     stream.onopen = () => { streamOpen = true; render(); };
     stream.onmessage = event => {
       const data = JSON.parse(event.data);
-      if (data.type !== 'HTTP_FLOOD_TELEMETRY' || data.profile !== 'policy-verification') return;
+      const expected = local ? 'HTTP_FLOOD_TELEMETRY' : 'HTTP_POLICY_RUN';
+      if (data.type !== expected || data.profile !== 'policy-verification') return;
       applyLab(data);
       render();
     };
@@ -225,7 +238,7 @@
 
   poll(async signal => {
     network = await read('/api/network/state', signal);
-    if (local) {
+    if (observeLab) {
       try { applyLab(await read('/api/attack-lab/verification', signal)); }
       catch { if (!streamOpen) lab = null; }
     }
