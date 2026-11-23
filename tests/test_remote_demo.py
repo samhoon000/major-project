@@ -286,11 +286,26 @@ class RemoteSocketTests(unittest.TestCase):
 
 
 class TunnelLifecycleTests(unittest.TestCase):
+    def test_exited_quick_connector_is_not_left_in_starting_state(self):
+        from backend.network.tunnel import TunnelManager
+        manager = TunnelManager(token="", mode="quick")
+        manager.process = MagicMock()
+        manager.process.poll.return_value = 1
+        manager._recent_logs = ["Provisioning request failed"]
+        with patch("backend.network.tunnel.get_lan_ipv4", return_value="127.0.0.1"):
+            status = manager.status_dict()
+        self.assertEqual(status["status"], "error")
+        self.assertIn("Provisioning request failed", status["error"])
+
     def test_quick_tunnel_needs_no_token_and_pins_its_own_hostname(self):
         from backend.network.tunnel import TunnelManager
         manager=TunnelManager(token="",mode="quick",local_port=8001)
         process=MagicMock();process.poll.return_value=None
-        process.stdout=io.StringIO("https://first-demo.trycloudflare.com\nRegistered tunnel connection connIndex=0\nhttps://other-demo.trycloudflare.com\n")
+        process.stdout=io.StringIO(
+            'ERR request failed for https://api.trycloudflare.com/tunnel\n'
+            'INF |  https://first-demo.trycloudflare.com  |\n'
+            'Registered tunnel connection connIndex=0\nhttps://other-demo.trycloudflare.com\n'
+        )
         with patch.object(manager,"find_cloudflared_executable",return_value="cloudflared"), \
                 patch("backend.network.tunnel.subprocess.Popen",return_value=process) as launch:
             self.assertTrue(manager.start());manager._monitor_thread.join(1)

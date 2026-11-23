@@ -18,11 +18,14 @@ from starlette.responses import JSONResponse
 
 log = logging.getLogger(__name__)
 TARGET = "/api/attack-lab/http-flood-target"
+BROWSER_TARGET = "/api/attack-lab/http-verification/request"
 HEADER = "x-sentinel-lab-key"
 METHOD = "Rule-Based HTTP Flood Detection"
 POLICY_CHECK_MAX_REQUESTS = 25
 POLICY_CHECK_TIMEOUT_MARGIN = 2
 POLICY_TRAFFIC_WINDOW = 60
+PHONE_CHECK_COOLDOWN = 5
+PHONE_CHECK_TIMEOUT_MARGIN = 8
 
 
 class RunConfig(BaseModel):
@@ -106,6 +109,8 @@ class HTTPFloodSimulator:
         self.detection_rps = self.block_until = self.baseline_rps = 0.0
         self.warned = self.recovered = False
         self.status, self.error, self.sequence = "ready", None, 0
+        self.source_identity = "lab-flood"
+        self.target_path = TARGET
         self.timeline, self.pending_events = deque(maxlen=200), deque(maxlen=500)
         self.recent_rejections, self._published_rejected = deque(maxlen=200), 0
         self.samples, self.traffic = deque(maxlen=120), deque(maxlen=4096)
@@ -119,8 +124,8 @@ class HTTPFloodSimulator:
     def _event(self, kind, message, **data):
         self.sequence += 1
         event = dict(type=kind, timestamp=self.wall_clock(), sequence=self.sequence,
-                     run_id=self.run_id, message=message, source_identity="lab-flood",
-                     target=TARGET, detection_method=METHOD, **data)
+                     run_id=self.run_id, message=message, source_identity=self.source_identity,
+                     target=self.target_path, detection_method=METHOD, **data)
         if kind == "HTTP_REQUEST_BLOCKED":
             self.recent_rejections.append(event)
         else:
@@ -218,18 +223,18 @@ class HTTPFloodSimulator:
             pass
         return evidence[-20:]
 
-    def get_state(self):
+    def get_state(self, *, include_network_evidence=True):
         self._expire()
         rates = self._rates()
-        evidence = self._network_evidence()
+        evidence = self._network_evidence() if include_network_evidence else []
         legitimate = dict(self.counts["legitimate"])
         completed = legitimate["generated"] - legitimate["in_flight"]
         legitimate["success_rate"] = round(legitimate["successful"]/completed,4) if completed else None
         return dict(run_id=self.run_id, sequence=self.sequence, snapshot_at=self.wall_clock(), status=self.status,
                     running=bool(self.task and not self.task.done()),
                     monitoring=bool(self.monitor_task and not self.monitor_task.done()),
-                    attack_name="HTTP Flood (Application-Layer DoS)", target=TARGET,
-                    target_origin=self.base_url, source_identity="lab-flood",
+                    attack_name="HTTP Flood (Application-Layer DoS)", target=self.target_path,
+                    target_origin=self.base_url, source_identity=self.source_identity,
                     source_ip="loopback / isolated capability (shared IP never blocked)",
                     config=self.config.model_dump(), limits=dict(max_rate=50, max_duration=20,
                         max_concurrency=8, max_requests=1000),
@@ -437,19 +442,22 @@ class HTTPFloodSimulator:
 
     async def reset(self, *, stop_running=False):
         async with self.lock:
-            if stop_running:
-                await self._stop()
-            elif self.task and not self.task.done():
-                raise ValueError("Stop the generator before resetting")
-            tasks = [t for t in (self.monitor_task, self.publisher_task) if t]
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            self.task = self.monitor_task = self.publisher_task = None
-            self._clear()
-            self._event("HTTP_LAB_RESET", "Demonstration reset; capabilities rotated")
-            await self._publish()
-            return self.get_state()
+            return await self._reset(stop_running)
+
+    async def _reset(self, stop_running):
+        if stop_running:
+            await self._stop()
+        elif self.task and not self.task.done():
+            raise ValueError("Stop the generator before resetting")
+        tasks = [t for t in (self.monitor_task, self.publisher_task) if t]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self.task = self.monitor_task = self.publisher_task = None
+        self._clear()
+        self._event("HTTP_LAB_RESET", "Demonstration reset; capabilities rotated")
+        await self._publish()
+        return self.get_state()
 
     async def close(self):
         async with self.lock:
@@ -469,8 +477,9 @@ class HTTPPolicyVerification(HTTPFloodSimulator):
 
     def __init__(self):
         self.next_request_at = 0.0
+        self.phone_cooldown_until = 0.0
         # The chart spans runs, so reset only clears the per-run detector state.
-        self.traffic_responses: list[tuple[float, int]] = []
+        self.traffic_responses: list[tuple[float, int, str]] = []
         super().__init__(DetectorConfig(window=4, warning_rps=0.5, block_rps=0.75, block_seconds=8))
 
     def _clear(self):
@@ -478,28 +487,49 @@ class HTTPPolicyVerification(HTTPFloodSimulator):
         self.config = PolicyCheckConfig()
         self.response_latencies = []
         self.outcome = None
+        self.phone_owner = None
+        self.phone_next_request_at = 0.0
+        self.phone_deadline = 0.0
 
-    def get_state(self):
-        snapshot = super().get_state()
+    def get_state(self, *, include_network_evidence=True):
+        snapshot = super().get_state(include_network_evidence=include_network_evidence)
         unused_count_field = "request_count" if self.config.duration is not None else "duration"
         snapshot["config"].pop(unused_count_field)
         return dict(
             snapshot, profile="policy-verification", outcome=self.outcome,
+            run_source="cloudflare-browser" if self.phone_owner is not None else "host-loopback",
+            source_ip="Cloudflare / operator browser" if self.phone_owner is not None else snapshot["source_ip"],
             request_count=self.config.selected_count,
             attack_name="Isolated HTTP rate-policy verification",
             limits=dict(max_rate=1, max_requests=POLICY_CHECK_MAX_REQUESTS, max_concurrency=1,
-                        max_duration=POLICY_CHECK_MAX_REQUESTS + POLICY_CHECK_TIMEOUT_MARGIN),
+                        max_duration=(POLICY_CHECK_MAX_REQUESTS + POLICY_CHECK_TIMEOUT_MARGIN if self.phone_owner is None
+                                      else PHONE_CHECK_TIMEOUT_MARGIN + POLICY_CHECK_MAX_REQUESTS * 2)),
             latency_average_ms=round(sum(self.response_latencies) / len(self.response_latencies), 2)
             if self.response_latencies else None,
         )
 
-    def _prune_traffic(self, now):
-        self.traffic_responses = [(arrived_at, status) for arrived_at, status in self.traffic_responses
-                                  if now - POLICY_TRAFFIC_WINDOW < arrived_at <= now]
+    def operator_snapshot(self, session=None):
+        """Expose measured policy results without host details, raw flows, or exception text."""
+        state = self.get_state(include_network_evidence=False)
+        fields = ("run_id", "snapshot_at", "profile", "config", "request_count", "running", "outcome",
+                  "started_at", "stopped_at", "elapsed_seconds", "total_rps", "peak_rps", "thresholds",
+                  "blocked", "latency_average_ms", "detection_method", "run_source")
+        event_fields = {"type", "timestamp", "observed_rps", "severity", "alert_id", "expires_at", "status_code"}
+        result_fields = ("generated", "in_flight", "successful", "blocked", "failed")
+        return dict(type="HTTP_POLICY_RUN", **{key: state[key] for key in fields},
+                    owns_run=session is not None and session is self.phone_owner,
+                    error="Local policy check failed. See the host console." if state["error"] else None,
+                    timeline=[{key: value for key, value in event.items() if key in event_fields}
+                              for event in state["timeline"]],
+                    flood={key: state["flood"][key] for key in result_fields})
 
-    def record_traffic_response(self, arrived_at, status):
+    def _prune_traffic(self, now):
+        self.traffic_responses = [response for response in self.traffic_responses
+                                  if now - POLICY_TRAFFIC_WINDOW < response[0] <= now]
+
+    def record_traffic_response(self, arrived_at, status, source="host-loopback"):
         if status in (200, 429):
-            self.traffic_responses.append((arrived_at, status))
+            self.traffic_responses.append((arrived_at, status, source))
             self._prune_traffic(self.wall_clock())
 
     def traffic_snapshot(self):
@@ -507,8 +537,10 @@ class HTTPPolicyVerification(HTTPFloodSimulator):
         self._prune_traffic(now)
         first = math.floor(now - POLICY_TRAFFIC_WINDOW)
         counts = [[0, 0] for _ in range(POLICY_TRAFFIC_WINDOW + 1)]
-        for arrived_at, status in self.traffic_responses:
+        sources = {"host-loopback": 0, "cloudflare-browser": 0}
+        for arrived_at, status, source in self.traffic_responses:
             counts[math.floor(arrived_at) - first][0 if status == 200 else 1] += 1
+            sources[source] += 1
         buckets = []
         for second, (accepted, blocked) in enumerate(counts, start=first):
             buckets.append(dict(timestamp=second, total_rps=accepted + blocked,
@@ -516,6 +548,9 @@ class HTTPPolicyVerification(HTTPFloodSimulator):
         accepted = sum(bucket["accepted_rps"] for bucket in buckets)
         blocked = sum(bucket["blocked_rps"] for bucket in buckets)
         return dict(type="HTTP_POLICY_TRAFFIC", snapshot_at=now, window_seconds=POLICY_TRAFFIC_WINDOW, buckets=buckets,
+                    run_id=self.run_id if self.started is not None else None,
+                    run_source=("cloudflare-browser" if self.phone_owner is not None else "host-loopback")
+                    if self.started is not None else None, sources=sources,
                     totals=dict(total=accepted + blocked, accepted=accepted, blocked=blocked),
                     thresholds=dict(block_rps=self.detector.block_rps, window_seconds=self.detector.window))
 
@@ -529,6 +564,86 @@ class HTTPPolicyVerification(HTTPFloodSimulator):
             self.task = asyncio.create_task(self._run_check(), name="http-policy-verification")
             self._ensure_publisher()
             return self.get_state()
+
+    async def start_phone_check(self, session, request_count):
+        async with self.lock:
+            if self._closed or self.started is not None:
+                raise ValueError("Reset the lab before starting another check")
+            if self.clock() < self.phone_cooldown_until:
+                raise ValueError("Wait five seconds after the previous browser run")
+            self.config = PolicyCheckConfig(request_count=request_count)
+            self.phone_owner = session
+            self.source_identity = "cloudflare-browser"
+            self.target_path = BROWSER_TARGET
+            self.started, self.status = self.wall_clock(), "attack_running"
+            self.phone_deadline = self.clock() + PHONE_CHECK_TIMEOUT_MARGIN + request_count * 2
+            self.task = asyncio.create_task(self._phone_timeout(), name="http-browser-verification")
+            self._ensure_publisher()
+            return self.operator_snapshot(session)
+
+    async def _phone_timeout(self):
+        await asyncio.sleep(max(0, self.phone_deadline - self.clock()))
+        async with self.lock:
+            self._expire_phone_check()
+
+    def _expire_phone_check(self):
+        if self.ended is None and self.clock() >= self.phone_deadline:
+            self.error = "Browser verification timed out"
+            self._finish_phone_check("error")
+
+    def _require_phone_run(self, session, run_id):
+        if session is not self.phone_owner or not self.phone_owner or run_id != self.run_id:
+            raise ValueError("No matching browser run for this operator session")
+
+    async def phone_request(self, session, run_id, sequence):
+        started = self.clock()
+        arrived_at = self.wall_clock()
+        async with self.lock:
+            self._require_phone_run(session, run_id)
+            self._expire_phone_check()
+            counts = self.counts["flood"]
+            if self.ended is not None or sequence != counts["generated"] + 1:
+                raise ValueError("Browser run ended or request sequence is out of order")
+            if self.clock() < self.phone_next_request_at:
+                raise ValueError("Wait at least one second between verification requests")
+            self.phone_next_request_at = self.clock() + 1
+            counts["generated"] += 1
+            previous_blocks = counts["blocked"]
+            blocked = self.observe("flood")
+            counts["blocked" if blocked else "successful"] += 1
+            status = 429 if blocked else 200
+            self.record_traffic_response(arrived_at, status, "cloudflare-browser")
+            self.response_latencies.append(round((self.clock() - started) * 1000, 2))
+            self._verify_followup(previous_blocks, counts["blocked"])
+            if sequence == self.config.selected_count:
+                self._finish_phone_check("complete")
+            return status
+
+    def _finish_phone_check(self, outcome):
+        if self.task is not None and self.task is not asyncio.current_task():
+            self.task.cancel()
+        self.task = None
+        self.phone_cooldown_until = self.clock() + PHONE_CHECK_COOLDOWN
+        self.ended = self.wall_clock()
+        self.outcome = outcome
+        self.status = "error" if self.error else "attack_stopped"
+        self._event("HTTP_FLOOD_STOPPED", "Cloudflare browser policy check ended", outcome=outcome)
+        self._expire()
+
+    async def phone_command(self, session, run_id, action):
+        async with self.lock:
+            self._require_phone_run(session, run_id)
+            self._expire_phone_check()
+            if action == "stop" and self.ended is None:
+                self._finish_phone_check("stopped")
+            if action == "reset":
+                await self._reset(stop_running=False)
+            return self.operator_snapshot(session)
+
+    def _verify_followup(self, previous_blocks, blocked):
+        if previous_blocks == 1 and blocked == 2:
+            self._event("HTTP_PROTECTION_VERIFIED", "Subsequent request received HTTP 429 from this lab",
+                        status_code=429, rejected_requests=blocked)
 
     async def _run_check(self):
         request_count = self.config.selected_count
@@ -544,10 +659,7 @@ class HTTPPolicyVerification(HTTPFloodSimulator):
                     if counts["failed"] > previous_errors:
                         return "error"
                     self.response_latencies.append(counts["latency_ms"])
-                    if previous_blocks == 1 and counts["blocked"] == 2:
-                        self._event("HTTP_PROTECTION_VERIFIED",
-                                    "Subsequent request received HTTP 429 from this lab",
-                                    status_code=429, rejected_requests=counts["blocked"])
+                    self._verify_followup(previous_blocks, counts["blocked"])
                 return "complete"
 
         try:
@@ -568,6 +680,9 @@ class HTTPPolicyVerification(HTTPFloodSimulator):
             self._event("HTTP_FLOOD_STOPPED", "Local HTTP policy check ended", outcome=self.outcome)
 
     async def _stop(self):
+        if self.phone_owner is not None and self.ended is None:
+            self._finish_phone_check("stopped")
+            return
         await super()._stop()
         if self.started is not None and self.outcome is None:
             self.outcome = "stopped"

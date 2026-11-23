@@ -32,7 +32,8 @@ OPERATOR_PAGES = frozenset({
 
 
 def remote_enabled():
-    return os.getenv("HTTP_FLOOD_REMOTE_ENABLED", "false").lower() in ("1", "true", "yes")
+    return (not browser_verification_enabled()
+            and os.getenv("HTTP_FLOOD_REMOTE_ENABLED", "false").lower() in ("1", "true", "yes"))
 
 
 def dashboard_remote_enabled():
@@ -43,6 +44,10 @@ def dashboard_remote_enabled():
 def operator_console_enabled():
     return (os.getenv("SENTINEL_REMOTE_CONSOLE", "false").lower() in ("1", "true", "yes")
             or os.getenv("DASHBOARD_REMOTE_ENABLED", "false").lower() in ("1", "true", "yes"))
+
+
+def browser_verification_enabled():
+    return os.getenv("HTTP_POLICY_REMOTE_VERIFY_ENABLED", "false").lower() in ("1", "true", "yes")
 
 
 def is_remote_operator_console(connection):
@@ -348,7 +353,10 @@ class DemoExposure:
                        "/api/tunnel/state", "/api/tunnel/qr.svg"}
     OPERATOR_READ = {"/api/network/state", "/api/chat/state", "/api/attack-lab/status",
                      "/api/attack-lab/http-flood/state", "/api/attack-lab/http-flood-target",
-                     "/api/network/quarantine"}
+                     "/api/network/quarantine", "/api/attack-lab/verification",
+                     "/api/attack-lab/verification/traffic"}
+    BROWSER_VERIFICATION = {"/api/attack-lab/http-verification/" + command
+                            for command in ("start", "request", "stop", "reset")}
 
     def __init__(self, app):
         self.app = app
@@ -383,6 +391,9 @@ class DemoExposure:
                 response = RedirectResponse(path, status_code=307)
         elif remote_console and path == "/":
             response = RedirectResponse("/dashboard", status_code=307)
+        elif remote_console and path in self.BROWSER_VERIFICATION:
+            if scope["method"] != "POST" or not browser_verification_enabled():
+                response = JSONResponse({"detail": "Not found"}, status_code=404)
         elif remote_console and path not in self.OPERATOR_PUBLIC | self.OPERATOR_READ | (self.CONTROL if remote_enabled() else set()):
             response = JSONResponse({"detail": "Not found"}, status_code=404)
         elif not remote_console and dashboard_only and path not in self.CHAT_AND_DASHBOARD:

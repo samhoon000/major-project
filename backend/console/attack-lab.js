@@ -1,8 +1,11 @@
 (() => {
   const {id, node, status, metrics, facts} = window.SentinelConsole;
   const auth = window.SentinelAuth;
-  const canControl = () => auth.local && auth.authenticated;
+  const controls = Boolean(id('lab-start'));
+  const local = document.body.dataset.labMode === 'local';
+  const canControl = () => controls && auth.authenticated && (local ? auth.local : auth.remoteConsole);
   const endpoint = '/api/attack-lab/verification';
+  const browserEndpoint = '/api/attack-lab/http-verification';
   const stages = ['HTTP_TRAFFIC_OBSERVED', 'HTTP_FLOOD_ATTACK_DETECTED', 'HTTP_SECURITY_ALERT',
     'HTTP_MITIGATION_ACTIVATED', 'HTTP_PROTECTION_VERIFIED'];
   const readable = {
@@ -15,10 +18,11 @@
     HTTP_REQUESTS_REJECTED: 'Server recorded rejected requests',
     HTTP_REQUEST_FAILED: 'Request failed',
     HTTP_FLOOD_STOPPED: 'Request dispatch ended',
-    HTTP_SOURCE_UNBLOCKED: 'Temporary restriction expired'
+    HTTP_SOURCE_UNBLOCKED: 'Temporary restriction expired',
+    HTTP_FLOOD_RECOVERED: 'Policy check recovered'
   };
   let snapshot, available = false, busy = false, error = '', timer, disposed = false, pending;
-  let stream, reconnect, retries = 0;
+  let stream, reconnect, browserDispatch, retries = 0;
   const time = timestamp => new Date(timestamp * 1000).toLocaleTimeString();
   const ms = value => value == null ? null : value + ' ms';
   const timeline = id('lab-lifecycle').children;
@@ -29,20 +33,23 @@
   function render() {
     const data = snapshot;
     const running = data?.running;
-    const locked = !canControl() || busy || !available;
-    id('lab-start').disabled = locked || Boolean(data?.started_at);
-    id('lab-stop').disabled = locked || !running;
-    id('lab-reset').disabled = locked || !data?.started_at;
-    requestCount.disabled = locked || Boolean(data?.started_at);
-    id('lab-admin-note').hidden = canControl();
-    if (data?.started_at) {
-      rate.value = data.config.rate;
-      requestCount.value = data.request_count;
-      concurrency.value = data.config.concurrency;
+    if (controls) {
+      const locked = !canControl() || busy || !available;
+      const ownsRun = local || data?.owns_run;
+      id('lab-start').disabled = locked || Boolean(data?.started_at);
+      id('lab-stop').disabled = locked || !ownsRun || !running;
+      id('lab-reset').disabled = locked || !ownsRun || !data?.started_at || !local && running;
+      requestCount.disabled = locked || Boolean(data?.started_at);
+      id('lab-admin-note').hidden = canControl();
+      if (data?.started_at) {
+        rate.value = data.config.rate;
+        requestCount.value = data.request_count;
+        concurrency.value = data.config.concurrency;
+      }
     }
-    status('lab-status', !available ? 'Local service unavailable' : running ? 'Check running' :
+    status('lab-status', !available ? 'Telemetry unavailable' : running ? 'Check running' :
       data?.outcome === 'stopped' ? 'Stopped' : data?.error ? 'Check failed' :
-      data?.stopped_at ? 'Check finished' : 'Local service ready',
+      data?.stopped_at ? 'Check finished' : 'Awaiting a run',
     !available ? '' : data?.error ? 'bad' : running ? 'warn' : 'good');
     id('lab-error').hidden = !error && !data?.error;
     id('lab-error').textContent = error || data?.error || '';
@@ -56,16 +63,21 @@
 
     const counts = data?.flood;
     const selectedCount = data?.started_at ? data.request_count :
-      requestCount.validity.valid ? requestCount.valueAsNumber : null;
+      requestCount?.validity.valid ? requestCount.valueAsNumber : null;
     const completed = counts ? counts.generated - counts.in_flight : null;
+    const browserRun = data?.run_source === 'cloudflare-browser';
+    const latencyLabel = browserRun ? 'Mean server processing latency' : 'Mean response latency';
     metrics('lab-metrics', [
       ['Selected request count', selectedCount],
       ['Requests attempted', counts?.generated], ['Accepted · HTTP 200', counts?.successful],
       ['Rejected · HTTP 429', counts?.blocked], ['Failed or cancelled', counts?.failed],
       ['Requests in the last second', available ? data?.total_rps : null],
-      ['Completed attempts', completed], ['Mean response latency', ms(data?.latency_average_ms)]
+      ['Completed attempts', completed], [latencyLabel, ms(data?.latency_average_ms)]
     ]);
     facts('lab-evidence', [
+      ['Run ID', data?.started_at ? data.run_id : null],
+      ['HTTP traffic origin', data?.started_at ? browserRun ? 'Authenticated browser · Cloudflare HTTPS' :
+        'Sentinel host · loopback test endpoint' : null],
       ['Detection', detection ? 'Threshold reached' : data?.stopped_at ? 'Threshold not reached' : 'Waiting for detection'],
       ['Detection threshold', data?.thresholds ? data.thresholds.block_rps + ' requests/s over a ' +
         data.thresholds.window_seconds + ' s window' : null],
@@ -73,13 +85,14 @@
       ['Evidence', detection ? detection.observed_rps + ' requests/s over a ' + data.thresholds.window_seconds + ' s window' : null],
       ['Security alert', alert ? alert.severity + ' · ' + alert.alert_id : 'Pending'],
       ['Automatic mitigation', rule ? data.blocked ? 'Active' : 'Expired' : 'Pending'],
-      ['Scope', rule ? 'This lab client and isolated endpoint' : null],
+      ['Scope', rule ? 'This run and its dedicated endpoint' : null],
       ['Expiration', rule ? time(rule.expires_at) : null],
-      ['Verified HTTP rejection', verified ? 'HTTP ' + verified.status_code + ' · Too Many Requests' : 'Pending']
+      ['Verified HTTP rejection', verified ? 'HTTP ' + verified.status_code + ' · Too Many Requests' : 'Pending'],
+      ['Recovery', events.some(event => event.type === 'HTTP_FLOOD_RECOVERED') ? 'No active restriction' : null]
     ]);
     id('lab-events').replaceChildren(...events.filter(event => readable[event.type]).slice(-10).map(event => {
       const row = node('li');
-      row.append(node('span', event.type === 'HTTP_REQUEST_FAILED' ? event.message : readable[event.type]),
+      row.append(node('span', event.type === 'HTTP_REQUEST_FAILED' && event.message ? event.message : readable[event.type]),
         node('time', time(event.timestamp)));
       return row;
     }));
@@ -91,7 +104,7 @@
       facts('lab-result-facts', [
         ['Selected request count', selectedCount], ['Attempted', counts.generated], ['Completed attempts', completed],
         ['HTTP 200', counts.successful], ['HTTP 429', counts.blocked],
-        ['Failed or cancelled', counts.failed], ['Mean response latency', ms(data.latency_average_ms)],
+        ['Failed or cancelled', counts.failed], [latencyLabel, ms(data.latency_average_ms)],
         ['Peak sampled requests/s', data.peak_rps],
         ['Elapsed time', data.elapsed_seconds + ' s']
       ]);
@@ -134,7 +147,12 @@
   async function command(action) {
     if (!canControl() || busy || action === 'start' && !requestCount.reportValidity()) return;
     const options = {method: 'POST'};
-    if (action === 'start') {
+    let url = endpoint + '/' + action;
+    if (!local) {
+      const params = action === 'start' ? {request_count: requestCount.valueAsNumber} : {run_id: snapshot.run_id};
+      url = browserEndpoint + '/' + action + '?' + new URLSearchParams(params);
+      if (action === 'stop') browserDispatch?.abort();
+    } else if (action === 'start') {
       options.headers = {'Content-Type': 'application/json'};
       options.body = JSON.stringify({request_count: requestCount.valueAsNumber});
     }
@@ -144,7 +162,9 @@
     pending?.abort();
     render();
     try {
-      accept(await read(endpoint + '/' + action, options));
+      const data = await read(url, options);
+      accept(data);
+      if (!local && action === 'start') void dispatchBrowserRequests(data.run_id, data.request_count);
     } catch (failure) {
       error = failure.message;
     } finally {
@@ -154,16 +174,48 @@
     }
   }
 
+  async function dispatchBrowserRequests(runId, count) {
+    const controller = new AbortController();
+    browserDispatch = controller;
+    try {
+      for (let sequence = 1; sequence <= count; sequence++) {
+        if (sequence > 1) await new Promise(resolve => setTimeout(resolve, 1150));
+        if (controller.signal.aborted) break;
+        const query = new URLSearchParams({run_id: runId, sequence});
+        const response = await auth.fetch(browserEndpoint + '/request?' + query, {
+          method: 'POST', cache: 'no-store', signal: AbortSignal.any([controller.signal, AbortSignal.timeout(3500)])
+        });
+        const result = await response.json();
+        if (![200, 429].includes(response.status) || result.run_id !== runId || result.sequence !== sequence) {
+          throw new Error(typeof result.detail === 'string' ? result.detail : 'The verification response could not be confirmed.');
+        }
+      }
+    } catch (failure) {
+      if (!controller.signal.aborted && !disposed) {
+        error = failure.message;
+        try {
+          accept(await read(browserEndpoint + '/stop?' + new URLSearchParams({run_id: runId}), {method: 'POST'}));
+        } catch {
+          // The server deadline releases the run if the browser loses connectivity.
+        }
+        render();
+      }
+    } finally {
+      if (browserDispatch === controller) browserDispatch = null;
+    }
+  }
+
   function connect() {
     if (disposed) return;
-    const url = new URL('/ws/dashboard', location.href);
+    const url = new URL(local ? '/ws/dashboard' : '/ws/dashboard?view=http-policy-run', location.href);
     url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     stream = new WebSocket(url);
     stream.addEventListener('open', () => { retries = 0; });
     stream.addEventListener('message', event => {
       try {
         const data = JSON.parse(event.data);
-        if (data.type !== 'HTTP_FLOOD_TELEMETRY' || data.profile !== 'policy-verification' || busy) return;
+        const expected = local ? 'HTTP_FLOOD_TELEMETRY' : 'HTTP_POLICY_RUN';
+        if (data.type !== expected || data.profile !== 'policy-verification' || busy) return;
         accept(data);
         render();
       } catch {
@@ -176,14 +228,15 @@
   }
 
   for (const action of ['start', 'stop', 'reset']) {
-    id('lab-' + action).addEventListener('click', () => command(action));
+    id('lab-' + action)?.addEventListener('click', () => command(action));
   }
-  requestCount.addEventListener('input', render);
+  requestCount?.addEventListener('input', render);
   window.addEventListener('sentinel-auth-changed', render);
   window.addEventListener('pagehide', () => {
     disposed = true;
     clearTimeout(timer);
     clearTimeout(reconnect);
+    browserDispatch?.abort();
     pending?.abort();
     stream?.close();
   });

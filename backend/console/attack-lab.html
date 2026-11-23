@@ -6,7 +6,7 @@
   <title>Live Attack Lab · Sentinel</title>
   <style>/* lab styles */</style>
 </head>
-<body class="lab-page">
+<body class="lab-page" data-lab-mode="local">
 <main>
   <header class="console-heading lab-hero">
     <div>
@@ -19,6 +19,8 @@
       <a class="console-button console-back" href="/dashboard">Back to Dashboard</a>
     </div>
   </header>
+  <!-- remote lab note -->
+  <!-- begin local controls -->
   <!-- administrator access -->
   <section class="console-card lab-controls" aria-label="Demonstration controls">
     <fieldset class="lab-settings" aria-describedby="lab-limits">
@@ -35,12 +37,15 @@
       <button id="lab-reset" class="console-button" type="button" disabled>Reset</button>
     </div>
     <p id="lab-admin-note" class="console-caption">Sign in as a local administrator to configure or control a run.</p>
-    <span id="lab-status" class="console-status" role="status">Checking local service</span>
     <p id="lab-limits" class="console-caption">The check sends 1–25 requests to the isolated loopback endpoint, one at a time and at most one per second. Choose at least four requests to observe mitigation followed by a separate HTTP 429.</p>
-    <p id="lab-error" class="console-caption" role="alert" hidden></p>
   </section>
+  <!-- end local controls -->
   <section class="console-card" aria-labelledby="lifecycle-heading">
-    <h2 id="lifecycle-heading">Attack Lifecycle</h2>
+    <div class="console-section-head">
+      <h2 id="lifecycle-heading">Attack Lifecycle</h2>
+      <span id="lab-status" class="console-status" role="status">Connecting</span>
+    </div>
+    <p id="lab-error" class="console-caption" role="alert" hidden></p>
     <ol id="lab-lifecycle" class="console-pipeline lab-lifecycle">
       <li>Traffic Observed<span>Pending</span></li>
       <li>Threat Detected<span>Pending</span></li>
@@ -65,6 +70,7 @@
     <p id="lab-result-message"></p>
     <dl id="lab-result-facts" class="console-facts"></dl>
   </section>
+  <!-- begin local port scan -->
   <section id="port-scan-lab" class="console-card" aria-labelledby="port-scan-lab-heading">
     <div class="console-section-head">
       <h2 id="port-scan-lab-heading">Port Scan Detection</h2>
@@ -78,6 +84,7 @@
     </div>
     <p id="port-scan-feedback" role="status"></p>
   </section>
+  <!-- end local port scan -->
 </main>
 <script>/* lab script */</script>
 </body>

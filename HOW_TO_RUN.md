@@ -20,7 +20,7 @@ Setup creates a virtual environment, installs dependencies, checks model assets,
 
 For a manual launch after setup, run `.\venv\Scripts\python.exe -m uvicorn app:app --host 127.0.0.1 --port 8001 --no-proxy-headers` from the repository root. Use one server process. The proxy flag lets the app validate the actual connection peer.
 
-The complete Sentinel console is at [http://127.0.0.1:8001/dashboard](http://127.0.0.1:8001/dashboard). Its sidebar opens Overview, Monitored Applications, Attack Lab, Network Analysis, Chat Security, and Settings in that same application. The standard Quick Tunnel setup below points to `app:app` and uses Sentinel's configured remote access rules. Monitored Applications and its Northfield telemetry are available on loopback. Attack Lab availability on a tunnel follows the existing remote demo configuration.
+The complete Sentinel console is at [http://127.0.0.1:8001/dashboard](http://127.0.0.1:8001/dashboard). Its sidebar opens Overview, Monitored Applications, Network Analysis, Chat Security, and Settings. Overview links to the Attack Lab. The Quick Tunnel points to the same `app:app` process, so the local and remote views share monitoring state.
 
 If a URL displays **Not available in the chat preview.**, it belongs to a temporary chat-only test server. Open the complete console URL above for all six modules. For remote chat, use the public joining link reported by the currently running Sentinel application.
 
@@ -66,10 +66,17 @@ Choose one way to start the tunnel. Sentinel can start it automatically, or you 
    CLOUDFLARE_PUBLIC_HOSTNAME=
    DASHBOARD_REMOTE_ENABLED=true
    HTTP_FLOOD_REMOTE_ENABLED=false
+   HTTP_POLICY_REMOTE_VERIFY_ENABLED=true
    NETWORK_AUTO_QUARANTINE=false
    ```
 
-2. Restart Sentinel with the same loopback launch command. Once the tunnel reports `running`, read the current links at [local tunnel status](http://127.0.0.1:8001/api/tunnel/state), or run:
+2. Start Sentinel from the repository root with one worker. Once the tunnel reports `running`, read the current links at [local tunnel status](http://127.0.0.1:8001/api/tunnel/state).
+
+   ```powershell
+   .\start.ps1 -HostBinding 127.0.0.1 -Port 8001
+   ```
+
+   In a second PowerShell window, run:
 
    ```powershell
    Invoke-RestMethod http://127.0.0.1:8001/api/tunnel/state |
@@ -78,7 +85,7 @@ Choose one way to start the tunnel. Sentinel can start it automatically, or you 
 
 ### Start the tunnel in a second PowerShell window
 
-Use this option when you want to run the connector yourself. Set `CLOUDFLARE_TUNNEL_MODE=disabled`, leave `CLOUDFLARE_TUNNEL_TOKEN` blank, set `DASHBOARD_REMOTE_ENABLED=true`, and keep `HTTP_FLOOD_REMOTE_ENABLED=false`. Start or restart Sentinel on loopback and finish the local check above. Run the command below in the second PowerShell window.
+Use this option when you want to run the connector yourself. Set `CLOUDFLARE_TUNNEL_MODE=disabled`, leave `CLOUDFLARE_TUNNEL_TOKEN` blank, set `DASHBOARD_REMOTE_ENABLED=true` and `HTTP_POLICY_REMOTE_VERIFY_ENABLED=true`, and keep `HTTP_FLOOD_REMOTE_ENABLED=false`. Start or restart Sentinel on loopback and finish the local check above. Run the command below in the second PowerShell window.
 
 ```powershell
 $cloudflared = Join-Path ([Environment]::GetFolderPath('DesktopDirectory')) 'cloudflared\cloudflared.exe'
@@ -93,6 +100,17 @@ Wait for `Registered tunnel connection`. Copy the generated hostname, for exampl
 - Open `https://something-random.trycloudflare.com/dashboard`, enter the local `ADMIN_TOKEN`, and select **Authenticate** to view telemetry or unblock users.
 
 Keep Sentinel and its tunnel running while people use the links. Quick Tunnel URLs can change when the connector restarts, and uptime is not guaranteed. [Cloudflare Quick Tunnel docs](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)
+
+### Verify the HTTP policy from a phone
+
+1. On the host, open **Monitored Applications → HTTP Flood Lab traffic**. Keep the local Attack Lab or Overview open to see alerts and mitigation details.
+2. On the phone, open the assigned HTTPS URL at `/attack-lab` and sign in with the administrator token. Under **Cloudflare browser verification**, choose 1–25 requests, select **Start Verification**, and keep the page open.
+3. Compare the run ID, HTTP 200 and HTTP 429 counts, and mean server processing latency with the host view. HTTP events in the chart are tagged **Cloudflare browser** or **Host loopback**. The detector evaluates a rolling four-second window. A slow connection may stay below the threshold even if the phone sends all selected requests.
+4. Use **Stop** to stop your browser run. Use **Reset** after it ends, then wait for the five-second cooldown before starting again. The host administrator can clear a run whose browser session is no longer available. The graph retains the most recent 60 seconds across resets.
+
+The browser posts directly to a fixed, same-origin verification endpoint through Cloudflare. Sentinel accepts one sequential sample per second, with a maximum of 25 and an overall deadline of up to 58 seconds. One run occupies the shared lab at a time. The signed-in session that starts a browser run owns its request sequence and controls. The dedicated monitor streams require a same-origin administrator session over WSS, with authenticated HTTP snapshots as fallback.
+
+Set `HTTP_POLICY_REMOTE_VERIFY_ENABLED=false` if remote operators should only watch, and keep `HTTP_FLOOD_REMOTE_ENABLED=false`. Browser verification disables remote access to the legacy generator controls even if the legacy flag is enabled. The host’s local generator, network checks, firewall controls, and Northfield policy writes remain local. Captured adapter packets and GATv2 classifications appear in Network Analysis. Cloudflare HTTP observations are measured at the application and are separate from captured packet evidence.
 
 The SOC dashboard continues to show captured network activity when nobody has joined Chat. GATv2 findings appear as alerts only when the captured flow matches an active direct chat connection. Cloudflare-relayed chat uses message, URL, and behavior checks, and the timeline records those moderation actions.
 
