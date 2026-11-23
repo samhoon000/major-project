@@ -847,6 +847,45 @@ CHAT_HTML = r"""<!doctype html>
       margin-top: 2px;
     }
 
+    .unread-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 20px;
+      height: 20px;
+      padding: 0 6px;
+      border-radius: 10px;
+      background: #0d9488;
+      color: #ffffff;
+      font-size: 11px;
+      font-weight: 700;
+      line-height: 1;
+      margin-left: auto;
+      flex-shrink: 0;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+      transition: transform 0.15s ease, background-color 0.15s ease;
+      letter-spacing: -0.2px;
+    }
+
+    .unread-badge.pulse {
+      animation: unread-pulse 0.4s ease-out;
+    }
+
+    @keyframes unread-pulse {
+      0% { transform: scale(1); }
+      50% { transform: scale(1.22); }
+      100% { transform: scale(1); }
+    }
+
+    .user-item.has-unread {
+      background: rgba(15, 118, 110, 0.08);
+    }
+
+    .user-item.has-unread .user-meta-name {
+      color: #ffffff;
+      font-weight: 700;
+    }
+
     .user-empty {
       padding: 32px 16px;
       text-align: center;
@@ -1586,6 +1625,78 @@ CHAT_HTML = r"""<!doctype html>
       let activeRecipient = '';
       let onlineUsers = [];
       const messagesByPeer = new Map(); // peerName -> array of message objects
+      const unreadCounts = new Map(); // peerName -> integer unread count
+      const seenMessageIds = new Set(); // message_id -> deduplication
+      const BASE_DOCUMENT_TITLE = 'Sentinel // Secure Chat';
+
+      function getStorageKey(user) {
+        return 'sentinel_unread_' + encodeURIComponent(user || myName || '');
+      }
+
+      function loadUnreadCounts() {
+        unreadCounts.clear();
+        if (!myName) return;
+        try {
+          const raw = sessionStorage.getItem(getStorageKey(myName));
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            if (parsed && typeof parsed === 'object') {
+              for (const [peer, count] of Object.entries(parsed)) {
+                const n = parseInt(count, 10);
+                if (Number.isFinite(n) && n > 0) {
+                  unreadCounts.set(peer, n);
+                }
+              }
+            }
+          }
+        } catch (_) {}
+      }
+
+      function saveUnreadCounts() {
+        if (!myName) return;
+        try {
+          const obj = {};
+          for (const [peer, count] of unreadCounts.entries()) {
+            if (count > 0) obj[peer] = count;
+          }
+          sessionStorage.setItem(getStorageKey(myName), JSON.stringify(obj));
+        } catch (_) {}
+      }
+
+      function getUnreadCount(peer) {
+        return unreadCounts.get(peer) || 0;
+      }
+
+      function formatUnreadCount(count) {
+        return count > 99 ? '99+' : String(count);
+      }
+
+      function getTotalUnreadCount() {
+        let total = 0;
+        for (const count of unreadCounts.values()) {
+          total += count;
+        }
+        return total;
+      }
+
+      function updateDocumentTitle() {
+        const total = getTotalUnreadCount();
+        if (total > 0) {
+          document.title = `(${formatUnreadCount(total)}) ${BASE_DOCUMENT_TITLE}`;
+        } else {
+          document.title = BASE_DOCUMENT_TITLE;
+        }
+      }
+
+      function markAsRead(peer) {
+        if (!peer) return;
+        if (unreadCounts.has(peer) && unreadCounts.get(peer) > 0) {
+          unreadCounts.set(peer, 0);
+          saveUnreadCounts();
+          updateRosterUI();
+          updateDocumentTitle();
+        }
+      }
 
       // DOM Elements
       const $ = id => document.getElementById(id);
@@ -1678,8 +1789,9 @@ CHAT_HTML = r"""<!doctype html>
       }
 
       // Select conversation partner
-      window.selectRecipient = function(user) {
+      function selectRecipient(user) {
         activeRecipient = user;
+        markAsRead(user);
         recipientTitle.textContent = user;
         recipientStatus.textContent = 'Active now · Direct Secure Channel';
         headerAvatar.style.display = 'flex';
@@ -1702,7 +1814,8 @@ CHAT_HTML = r"""<!doctype html>
         }
 
         updateRosterUI();
-      };
+      }
+      window.selectRecipient = selectRecipient;
 
       function renderFeed() {
         chatFeed.innerHTML = '';
@@ -1750,7 +1863,8 @@ CHAT_HTML = r"""<!doctype html>
 
         filtered.forEach(user => {
           const item = document.createElement('div');
-          item.className = 'user-item' + (user === activeRecipient ? ' active' : '');
+          const unread = getUnreadCount(user);
+          item.className = 'user-item' + (user === activeRecipient ? ' active' : '') + (unread > 0 ? ' has-unread' : '');
           item.onclick = () => selectRecipient(user);
 
           const avatar = document.createElement('div');
@@ -1773,6 +1887,16 @@ CHAT_HTML = r"""<!doctype html>
           meta.appendChild(status);
           item.appendChild(avatar);
           item.appendChild(meta);
+
+          if (unread > 0) {
+            const badge = document.createElement('span');
+            badge.className = 'unread-badge';
+            badge.id = `unreadBadge_${user}`;
+            badge.textContent = formatUnreadCount(unread);
+            badge.setAttribute('aria-label', `${unread} unread message${unread === 1 ? '' : 's'}`);
+            item.appendChild(badge);
+          }
+
           userList.appendChild(item);
         });
       }
@@ -1801,7 +1925,7 @@ CHAT_HTML = r"""<!doctype html>
       });
 
       // WebSocket Connection
-      window.connect = function() {
+      function connect() {
         if (ws && ws.readyState < WebSocket.CLOSING) return;
         const rawName = (usernameInput.value || '').trim();
         if (!/^[A-Za-z0-9_-]{2,24}$/.test(rawName)) {
@@ -1817,8 +1941,13 @@ CHAT_HTML = r"""<!doctype html>
         if (myName && myName !== rawName) {
           messagesByPeer.clear();
           chatFeed.replaceChildren();
+          seenMessageIds.clear();
+          unreadCounts.clear();
         }
         myName = rawName;
+        loadUnreadCounts();
+        updateRosterUI();
+        updateDocumentTitle();
         const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
         const url = `${protocol}//${location.host}/ws/chat/${encodeURIComponent(myName)}`;
 
@@ -1846,21 +1975,54 @@ CHAT_HTML = r"""<!doctype html>
               msgInput.disabled = !activeRecipient || !onlineUsers.includes(activeRecipient);
               validateComposer();
               appendSystemAlert(`Connected to secure messaging as @${myName}`, 'info');
+              loadUnreadCounts();
             }
             updateRosterUI();
+            updateDocumentTitle();
             if (activeRecipient && !onlineUsers.includes(activeRecipient)) {
               recipientStatus.textContent = 'User went offline';
             }
           } else if (data.type === 'message') {
-            const peer = data.sender === myName ? data.recipient : data.sender;
+            const msgKey = data.message_id || `${data.sender}_${data.timestamp}_${data.text}`;
+            if (seenMessageIds.has(msgKey)) {
+              return;
+            }
+            seenMessageIds.add(msgKey);
+            if (seenMessageIds.size > 2000) {
+              const oldest = seenMessageIds.values().next().value;
+              seenMessageIds.delete(oldest);
+            }
+
+            const isSelf = data.sender === myName;
+            const peer = isSelf ? data.recipient : data.sender;
             if (!messagesByPeer.has(peer)) {
               messagesByPeer.set(peer, []);
             }
             messagesByPeer.get(peer).push(data);
 
             if (peer === activeRecipient) {
-              chatFeed.appendChild(createMessageElement(data, data.sender === myName));
+              chatFeed.appendChild(createMessageElement(data, isSelf));
               chatFeed.scrollTop = chatFeed.scrollHeight;
+            }
+
+            if (!isSelf) {
+              const isDocVisible = typeof document !== 'undefined' && document.visibilityState === 'visible';
+              const isActivelyViewing = (peer === activeRecipient) && isDocVisible;
+              if (isActivelyViewing) {
+                markAsRead(peer);
+              } else {
+                const count = (unreadCounts.get(peer) || 0) + 1;
+                unreadCounts.set(peer, count);
+                saveUnreadCounts();
+                updateRosterUI();
+                updateDocumentTitle();
+                const badge = $(`unreadBadge_${peer}`);
+                if (badge) {
+                  badge.classList.remove('pulse');
+                  void badge.offsetWidth;
+                  badge.classList.add('pulse');
+                }
+              }
             }
           } else if (data.type === 'warning') {
             appendSystemAlert(`Security Policy Notice: ${data.message}`, 'warn');
@@ -1890,10 +2052,11 @@ CHAT_HTML = r"""<!doctype html>
             joinErr.style.display = 'block';
           }
         };
-      };
+      }
+      window.connect = connect;
 
       // Send Message
-      window.send = function() {
+      function send() {
         const text = (msgInput.value || '').trim();
         if (!text || !activeRecipient) return;
 
@@ -1905,7 +2068,8 @@ CHAT_HTML = r"""<!doctype html>
           msgInput.value = '';
           validateComposer();
         }
-      };
+      }
+      window.send = send;
 
       sendBtn.onclick = send;
 
@@ -2024,6 +2188,35 @@ CHAT_HTML = r"""<!doctype html>
       const invitationTimer = setInterval(refreshTunnelState, 5000);
       window.addEventListener('pagehide', () => clearInterval(invitationTimer), {once: true});
       window.addEventListener('pageshow', event => { if (event.persisted) location.reload(); });
+
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible' && activeRecipient) {
+          markAsRead(activeRecipient);
+        }
+      });
+      window.addEventListener('focus', () => {
+        if (activeRecipient) {
+          markAsRead(activeRecipient);
+        }
+      });
+
+      window.SentinelChat = {
+        getUnreadCount,
+        getUnreadCounts: () => Object.fromEntries(unreadCounts),
+        getTotalUnread: getTotalUnreadCount,
+        markAsRead,
+        formatUnreadCount,
+        updateDocumentTitle,
+        loadUnreadCounts,
+        saveUnreadCounts,
+        updateRosterUI,
+        getState: () => ({
+          activeRecipient,
+          myName,
+          unreadCounts: Object.fromEntries(unreadCounts),
+          seenCount: seenMessageIds.size
+        })
+      };
 
     })();
   </script>
