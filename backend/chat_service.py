@@ -1990,7 +1990,11 @@ def tunnel_qr_svg() -> Response:
 @router.websocket("/ws/dashboard")
 async def dashboard_socket(ws: WebSocket) -> None:
     monitor = ws.query_params.get("view") == "chat-security"
+    lab_traffic = ws.query_params.get("view") == "http-flood-traffic"
     if not demo_security.can_view(ws) or (is_remote_operator_console(ws) and not monitor):
+        await ws.close(code=1008)
+        return
+    if lab_traffic and not boundary(ws).local:
         await ws.close(code=1008)
         return
     origin = ws.headers.get("origin")
@@ -2002,6 +2006,9 @@ async def dashboard_socket(ws: WebSocket) -> None:
     await ws.accept()
     if monitor:
         await chat_monitor_socket(ws)
+        return
+    if lab_traffic:
+        await http_lab_traffic_socket(ws)
         return
     dashboard_clients.add(ws)
     try:
@@ -2016,6 +2023,23 @@ async def dashboard_socket(ws: WebSocket) -> None:
         pass
     finally:
         dashboard_clients.discard(ws)
+
+
+async def http_lab_traffic_socket(ws: WebSocket) -> None:
+    from backend.security.http_flood import policy_verification
+
+    try:
+        while True:
+            await ws.send_json(policy_verification.traffic_snapshot())
+            try:
+                message = await asyncio.wait_for(ws.receive(), timeout=1)
+            except asyncio.TimeoutError:
+                continue
+            if message["type"] != "websocket.disconnect":
+                await ws.close(code=1008)
+            return
+    except WebSocketDisconnect:
+        pass
 
 
 async def chat_monitor_socket(ws: WebSocket) -> None:

@@ -1,5 +1,7 @@
 (() => {
   const {id, node, status, metrics, facts} = window.SentinelConsole;
+  const auth = window.SentinelAuth;
+  const canControl = () => auth.local && auth.authenticated;
   const endpoint = '/api/attack-lab/verification';
   const stages = ['HTTP_TRAFFIC_OBSERVED', 'HTTP_FLOOD_ATTACK_DETECTED', 'HTTP_SECURITY_ALERT',
     'HTTP_MITIGATION_ACTIVATED', 'HTTP_PROTECTION_VERIFIED'];
@@ -11,6 +13,7 @@
     HTTP_MITIGATION_ACTIVATED: 'Temporary restriction applied automatically',
     HTTP_PROTECTION_VERIFIED: 'Subsequent HTTP 429 response verified',
     HTTP_REQUESTS_REJECTED: 'Server recorded rejected requests',
+    HTTP_REQUEST_FAILED: 'Request failed',
     HTTP_FLOOD_STOPPED: 'Request dispatch ended',
     HTTP_SOURCE_UNBLOCKED: 'Temporary restriction expired'
   };
@@ -20,19 +23,21 @@
   const ms = value => value == null ? null : value + ' ms';
   const timeline = id('lab-lifecycle').children;
   const rate = id('hf-rate');
-  const duration = id('hf-duration');
+  const requestCount = id('hf-request-count');
   const concurrency = id('hf-concurrency');
 
   function render() {
     const data = snapshot;
     const running = data?.running;
-    id('lab-start').disabled = busy || !available || Boolean(data?.started_at);
-    id('lab-stop').disabled = busy || !available || !running;
-    id('lab-reset').disabled = busy || !available || !data?.started_at;
-    duration.disabled = busy || Boolean(data?.started_at);
+    const locked = !canControl() || busy || !available;
+    id('lab-start').disabled = locked || Boolean(data?.started_at);
+    id('lab-stop').disabled = locked || !running;
+    id('lab-reset').disabled = locked || !data?.started_at;
+    requestCount.disabled = locked || Boolean(data?.started_at);
+    id('lab-admin-note').hidden = canControl();
     if (data?.started_at) {
       rate.value = data.config.rate;
-      duration.value = data.config.duration;
+      requestCount.value = data.request_count;
       concurrency.value = data.config.concurrency;
     }
     status('lab-status', !available ? 'Local service unavailable' : running ? 'Check running' :
@@ -50,14 +55,20 @@
     });
 
     const counts = data?.flood;
+    const selectedCount = data?.started_at ? data.request_count :
+      requestCount.validity.valid ? requestCount.valueAsNumber : null;
     const completed = counts ? counts.generated - counts.in_flight : null;
     metrics('lab-metrics', [
+      ['Selected request count', selectedCount],
       ['Requests attempted', counts?.generated], ['Accepted · HTTP 200', counts?.successful],
-      ['Rejected · HTTP 429', counts?.blocked], ['Requests in the last second', available ? data?.total_rps : null],
+      ['Rejected · HTTP 429', counts?.blocked], ['Failed or cancelled', counts?.failed],
+      ['Requests in the last second', available ? data?.total_rps : null],
       ['Completed attempts', completed], ['Mean response latency', ms(data?.latency_average_ms)]
     ]);
     facts('lab-evidence', [
-      ['Detection', detection ? 'Suspicious request rate' : 'Waiting for detection'],
+      ['Detection', detection ? 'Threshold reached' : data?.stopped_at ? 'Threshold not reached' : 'Waiting for detection'],
+      ['Detection threshold', data?.thresholds ? data.thresholds.block_rps + ' requests/s over a ' +
+        data.thresholds.window_seconds + ' s window' : null],
       ['Source', detection ? data.detection_method : null],
       ['Evidence', detection ? detection.observed_rps + ' requests/s over a ' + data.thresholds.window_seconds + ' s window' : null],
       ['Security alert', alert ? alert.severity + ' · ' + alert.alert_id : 'Pending'],
@@ -68,7 +79,8 @@
     ]);
     id('lab-events').replaceChildren(...events.filter(event => readable[event.type]).slice(-10).map(event => {
       const row = node('li');
-      row.append(node('span', readable[event.type]), node('time', time(event.timestamp)));
+      row.append(node('span', event.type === 'HTTP_REQUEST_FAILED' ? event.message : readable[event.type]),
+        node('time', time(event.timestamp)));
       return row;
     }));
     if (!id('lab-events').children.length) id('lab-events').append(node('li', 'Waiting for backend events.'));
@@ -77,7 +89,7 @@
       id('lab-result-message').textContent = verified ? 'Automatic protection verified through a subsequent HTTP 429 response.' :
         'The run ended before automatic protection was verified.';
       facts('lab-result-facts', [
-        ['Attempted', counts.generated], ['Completed attempts', completed],
+        ['Selected request count', selectedCount], ['Attempted', counts.generated], ['Completed attempts', completed],
         ['HTTP 200', counts.successful], ['HTTP 429', counts.blocked],
         ['Failed or cancelled', counts.failed], ['Mean response latency', ms(data.latency_average_ms)],
         ['Peak sampled requests/s', data.peak_rps],
@@ -87,7 +99,7 @@
   }
 
   async function read(url, options) {
-    const response = await fetch(url, {cache: 'no-store', signal: AbortSignal.timeout(4000), ...options});
+    const response = await auth.fetch(url, {cache: 'no-store', signal: AbortSignal.timeout(4000), ...options});
     if (!response.ok) {
       const info = await response.json().catch(() => ({}));
       const detail = info.detail;
@@ -120,15 +132,11 @@
   }
 
   async function command(action) {
-    if (busy || action === 'start' && !duration.reportValidity()) return;
+    if (!canControl() || busy || action === 'start' && !requestCount.reportValidity()) return;
     const options = {method: 'POST'};
     if (action === 'start') {
       options.headers = {'Content-Type': 'application/json'};
-      options.body = JSON.stringify({
-        rate: rate.valueAsNumber,
-        duration: duration.valueAsNumber,
-        concurrency: concurrency.valueAsNumber
-      });
+      options.body = JSON.stringify({request_count: requestCount.valueAsNumber});
     }
     busy = true;
     error = '';
@@ -170,6 +178,8 @@
   for (const action of ['start', 'stop', 'reset']) {
     id('lab-' + action).addEventListener('click', () => command(action));
   }
+  requestCount.addEventListener('input', render);
+  window.addEventListener('sentinel-auth-changed', render);
   window.addEventListener('pagehide', () => {
     disposed = true;
     clearTimeout(timer);

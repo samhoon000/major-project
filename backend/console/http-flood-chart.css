@@ -1,8 +1,11 @@
-/* Historical graph styles from feature/sentinel-http-demo (cb37f89). */
 .hf{margin:18px 0;padding:22px;border:1px solid #315348;border-radius:12px;background:#091511;color:#dceee7;font:13px system-ui,sans-serif;text-align:left;box-sizing:border-box}
 .hf *{box-sizing:border-box}
 .hf h3{font-size:14px;margin:14px 0 8px}
 .hf-muted{color:#9cb9ae;font-size:12px}
 .hf svg{display:block;width:100%;height:auto;background:#07100d;border:1px solid #254a3a;border-radius:8px}
 .hf-legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;margin:10px 0}
+.hf-metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(125px,1fr));gap:8px;margin:14px 0}
+.hf-metrics div{background:#07100d;border:1px solid #254a3a;border-radius:8px;padding:10px 12px}
+.hf-metrics dt{color:#a0bcaf}
+.hf-metrics dd{margin:4px 0 0;font-size:22px;font-weight:650;font-variant-numeric:tabular-nums}
 @media(max-width:750px){.hf{padding:14px}}

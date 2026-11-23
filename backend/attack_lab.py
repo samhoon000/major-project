@@ -333,7 +333,9 @@ def attack_lab_page(request: Request) -> str:
         style = (FILES / "layout.css").read_text(encoding="utf-8")
         script = "\n".join((FILES / name).read_text(encoding="utf-8")
                            for name in ("layout.js", "attack-lab.js", "port-scan.js"))
-        return document.replace("/* lab styles */", style).replace("/* lab script */", script)
+        return (document.replace("/* lab styles */", style)
+                .replace("<!-- administrator access -->", security_panel())
+                .replace("/* lab script */", script))
     if remote_console and request.query_params.get("view") != "legacy":
         from backend.console import wrap_existing
         document = """<!doctype html>
@@ -365,7 +367,7 @@ def attack_lab_page(request: Request) -> str:
 </main>
 </html>"""
         return wrap_existing(request, "lab", document.replace(
-            "<!-- lab access -->", "<p>The local policy check is available on the host computer.</p>"))
+            "<!-- lab access -->", "<p>Administrators can configure and run the HTTP policy check from localhost on the host computer.</p>"))
     return ATTACK_LAB_HTML.replace("</header>", "</header>" + security_panel(), 1).replace("<!-- HTTP_FLOOD_PANEL -->", http_flood_panel(controls=True))
 
 
@@ -420,6 +422,15 @@ async def verification_state(request: Request):
     return policy_verification.get_state()
 
 
+@router.get("/api/attack-lab/verification/traffic")
+async def verification_traffic(request: Request):
+    from backend.security.demo_access import boundary
+
+    if not boundary(request).local:
+        raise HTTPException(404)
+    return JSONResponse(policy_verification.traffic_snapshot(), headers={"Cache-Control": "no-store"})
+
+
 @router.get("/api/attack-lab/port-scan")
 async def port_scan_snapshot(request: Request):
     from backend.security.demo_access import boundary, demo_security
@@ -455,6 +466,9 @@ def require_verification_control(request: Request):
     if not boundary(request).local:
         raise HTTPException(404)
     demo_security.check_origin(request, required=True)
+    if not demo_security.session(request) or request.headers.get("x-admin-token"):
+        raise HTTPException(401, "Sign in as a local administrator to control the Attack Lab")
+    demo_security.require_control(request, local_only=True)
     if request.query_params:
         raise HTTPException(422, "The policy check takes no query parameters")
 
